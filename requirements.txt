@@ -1,0 +1,11 @@
+python-telegram-bot>=21.6,<23.0
+pandas>=2.2
+numpy>=1.26
+aiohttp>=3.9
+aiosqlite>=0.20
+pydantic>=2.7
+PyYAML>=6.0
+python-dotenv>=1.0
+
+# для тестов
+pytest>=8.0

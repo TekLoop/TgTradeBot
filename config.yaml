@@ -1,0 +1,69 @@
+# Единственный файл, который нужно править для добавления актива.
+# Секретов здесь быть не должно — они живут в .env
+
+assets:
+  - symbol: HYPEUSDT
+    provider: binance
+    timeframes: [1H, 4H, 1D]
+
+  - symbol: BTCUSDT
+    provider: binance
+    timeframes: [3H, 4H, 1D, 1W]     # 3H у Binance нет — соберётся из 1H
+
+  # Токенизированные акции. ПРОВЕРЬТЕ symbol_id в providers.coinapi.symbol_map
+  # перед запуском (см. README, раздел «Проверка символов CoinAPI»).
+  - symbol: AAPLX
+    provider: coinapi
+    timeframes: [4H, 1D, 1W]         # 1W соберётся ресемплингом из 1D
+    enabled: false                   # включите, когда проверите символ
+
+params:
+  rsi_period: 14
+  fractal_n: 2                 # N свечей слева/справа для подтверждения фрактала
+  oversold: 30                 # порог ALERT #1 (бычий сценарий)
+  overbought: 70               # порог ALERT #1 (медвежий сценарий)
+  divergence_rsi_max: 35       # верхняя граница RSI для бычьей дивергенции
+  divergence_rsi_min: 65       # нижняя граница RSI для медвежьей дивергенции
+  reset_rsi: 50                # RSI выше → бычья опорная точка инвалидируется
+  reset_rsi_bear: 50           # RSI ниже → медвежья опорная точка инвалидируется
+  max_bars_between: 40         # максимум баров между точками дивергенции
+  bearish_enabled: false       # медвежья логика (по умолчанию выключена)
+  lookback_bars: 300           # глубина окна анализа
+  notify_max_age_bars: 3       # сигналы старше N баров записываются, но не шлются
+
+providers:
+  binance:
+    base_url: https://api.binance.com
+    requests_per_minute: 300
+    timeout_seconds: 15
+    retries: 4
+
+  coinapi:
+    base_url: https://rest.coinapi.io/v1
+    requests_per_minute: 20      # бесплатный тариф жёстко лимитирован
+    timeout_seconds: 20
+    retries: 4
+    strict_symbols: false        # true → запрещает символы без записи в symbol_map
+    symbol_map:
+      # ТИКЕР В КОНФИГЕ: symbol_id у CoinAPI (EXCHANGE_SPOT_BASE_QUOTE)
+      AAPLX: BINANCE_SPOT_AAPLX_USDT   # ← ПРИМЕР, обязательно проверьте
+      BTCUSDT: BINANCE_SPOT_BTC_USDT
+
+scheduler:
+  close_delay_seconds: 15          # опрос через +15 c после закрытия свечи
+  jitter_seconds: 5                # случайная добавка, чтобы не бить залпом
+  reconcile_interval_seconds: 60   # как часто сверять набор задач с БД
+  check_on_startup: true
+
+storage:
+  db_path: data/state.db
+
+logging:
+  level: INFO
+  file: logs/bot.log
+  max_bytes: 5242880
+  backup_count: 5
+
+sync:
+  remove_missing_assets: false   # true → активы вне YAML удаляются при старте
+  overwrite_params: false        # true → правки /params сбрасываются при старте
