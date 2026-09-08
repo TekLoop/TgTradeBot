@@ -22,8 +22,8 @@ params:
   fractal_n: 2                 # N свечей слева/справа для подтверждения фрактала
   oversold: 30                 # порог ALERT #1 (бычий сценарий)
   overbought: 70               # порог ALERT #1 (медвежий сценарий)
-  divergence_rsi_max: 35       # верхняя граница RSI для бычьей дивергенции
-  divergence_rsi_min: 65       # нижняя граница RSI для медвежьей дивергенции
+  divergence_rsi_max: 40       # верхняя граница RSI для бычьей дивергенции
+  divergence_rsi_min: 60       # нижняя граница RSI для медвежьей дивергенции
   reset_rsi: 50                # RSI выше → бычья опорная точка инвалидируется
   reset_rsi_bear: 50           # RSI ниже → медвежья опорная точка инвалидируется
   max_bars_between: 40         # максимум баров между точками дивергенции
@@ -33,7 +33,7 @@ params:
 
 providers:
   binance:
-    base_url: https://api.binance.com
+    base_url: https://data-api.binance.vision
     requests_per_minute: 300
     timeout_seconds: 15
     retries: 4
