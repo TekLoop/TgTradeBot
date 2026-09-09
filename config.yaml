@@ -2,13 +2,13 @@
 # Секретов здесь быть не должно — они живут в .env
 
 assets:
-  - symbol: HYPEUSDT
+  - symbol: ETHUSDT
     provider: binance
-    timeframes: [1H, 4H, 1D]
+    timeframes: [1H, 4H, 1D, 1W]
 
   - symbol: BTCUSDT
     provider: binance
-    timeframes: [3H, 4H, 1D, 1W]     # 3H у Binance нет — соберётся из 1H
+    timeframes: [1H, 4H, 1D, 1W]     # 3H у Binance нет — соберётся из 1H
 
   # Токенизированные акции. ПРОВЕРЬТЕ symbol_id в providers.coinapi.symbol_map
   # перед запуском (см. README, раздел «Проверка символов CoinAPI»).
