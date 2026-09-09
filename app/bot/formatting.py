@@ -187,8 +187,9 @@ def _aggregate(records: list[Outcome]) -> dict:
 def format_outcome_line(record: Outcome, short: bool = True) -> str:
     emoji = DIRECTION_EMOJI.get(record.direction, "🔔")
     head = (
-        f"{emoji} <b>{record.timeframe.value}</b> ×{record.degree} · "
-        f"вход <code>{fmt_price(record.entry_price)}</code> ({fmt_date(record.entry_time)})"
+        f"{emoji} <b>{escape(record.symbol)}</b> · <b>{record.timeframe.value}</b> "
+        f"×{record.degree} · вход <code>{fmt_price(record.entry_price)}</code> "
+        f"({fmt_date(record.entry_time)})"
     )
     body = (
         f"  в пользу <code>{fmt_pct(record.favorable_pct)}</code> · "
@@ -252,6 +253,20 @@ def format_stats(
                     f"плюсовых {agg_d['wins']}"
                 )
 
+        by_symbol: dict[str, list[Outcome]] = {}
+        for record in closed:
+            by_symbol.setdefault(record.symbol, []).append(record)
+        if len(by_symbol) > 1:
+            lines += ["", "<b>По активам</b>"]
+            for sym in sorted(by_symbol, key=lambda s: len(by_symbol[s]), reverse=True):
+                agg_s = _aggregate(by_symbol[sym])
+                lines.append(
+                    f"{escape(sym)} ({agg_s['count']}): итог <b>{fmt_pct(agg_s['result'])}</b> · "
+                    f"в пользу {fmt_pct(agg_s['favorable'])} · "
+                    f"против {fmt_pct(agg_s['adverse'])} · "
+                    f"плюсовых {agg_s['wins']}"
+                )
+
         by_tf: dict[str, list[Outcome]] = {}
         for record in closed:
             by_tf.setdefault(record.timeframe.value, []).append(record)
@@ -266,8 +281,12 @@ def format_stats(
 
     if open_records:
         lines += ["", "<b>Открытые записи</b>"]
-        for record in open_records[:10]:
+        ordered = sorted(open_records, key=lambda r: (r.symbol, r.timeframe.value))
+        for record in ordered[:10]:
             lines.append(format_outcome_line(record))
+        if len(ordered) > 10:
+            hidden = len(ordered) - 10
+            lines.append(f"<i>…и ещё {hidden}. Сузьте: /stats SYMBOL</i>")
 
     return "\n".join(lines)
 
