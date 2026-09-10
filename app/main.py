@@ -58,7 +58,10 @@ def build_application(config: AppConfig, secrets: Secrets) -> Application:
         await sync_config_to_storage(config, storage)
 
         notifier = Notifier(app.bot, storage, secrets.default_chat_id)
-        service = TrackingService(storage, providers, config.params, notifier)
+        service = TrackingService(
+            storage, providers, config.params, notifier,
+            params_by_timeframe=config.params_by_timeframe,
+        )
         scheduler = Scheduler(storage, service, config.scheduler)
 
         handlers = BotHandlers(storage, service, scheduler, secrets)
