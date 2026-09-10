@@ -279,11 +279,11 @@ def test_global_change_is_checked_against_every_timeframe(tmp_path):
     async def scenario():
         storage = await opened(path)
         service = TrackingService(
-            storage, {}, ParamsConfig(anchor_ttl_bars=40, max_bars_between_points=40),
+            storage, {}, ParamsConfig(anchor_ttl_bars=40, max_bars_between_points=20),
             params_by_timeframe={Timeframe.D1: {"anchor_ttl_bars": 60,
                                                 "max_bars_between_points": 60}},
         )
-        # глобальный ttl=30 несовместим с max=60, который стоит у 1D
+        # ttl=30 проходит для базы (max=20), но не для 1D (max=60), но это необязательно
         problem = await service.validate_override("anchor_ttl_bars", 30, None)
         await storage.close()
         return problem
