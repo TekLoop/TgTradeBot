@@ -231,11 +231,20 @@ def load_history(
 
 
 def load_params(config_path: str, db_path: str | None, overrides: dict):
-    """Пороги: config.yaml → оверрайды из /params в state.db → аргументы CLI."""
+    """Пороги: config.yaml → params_by_timeframe → /params из state.db → CLI.
+
+    Возвращает (базовый ParamsConfig, {Timeframe: слой оверрайдов}). Слои
+    накладываются на базу функцией build_params() из app/config.py — тем же
+    кодом, что и в боевом сервисе, чтобы прогон и бот не разъезжались.
+    """
     from app.config import EDITABLE_PARAMS, ParamsConfig, load_config
 
+    layers: dict[Timeframe, dict] = {}
     try:
-        params = load_config(config_path).params
+        config = load_config(config_path)
+        params = config.params
+        for tf, overlay in config.params_by_timeframe.items():
+            layers.setdefault(tf, {}).update(overlay)
     except Exception as exc:  # noqa: BLE001 — прогон возможен и без конфига
         print(f"config.yaml не прочитан ({exc}), беру значения по умолчанию",
               file=sys.stderr)
@@ -246,29 +255,69 @@ def load_params(config_path: str, db_path: str | None, overrides: dict):
     if db_path and Path(db_path).exists():
         try:
             with sqlite3.connect(db_path) as connection:
-                rows = connection.execute("SELECT key, value FROM params").fetchall()
+                columns = {
+                    row[1]
+                    for row in connection.execute("pragma table_info(params)").fetchall()
+                }
+                if "timeframe" in columns:
+                    rows = connection.execute(
+                        "SELECT key, timeframe, value FROM params"
+                    ).fetchall()
+                else:  # БД ещё не мигрирована — все записи глобальные
+                    rows = [
+                        (key, "", value)
+                        for key, value in connection.execute(
+                            "SELECT key, value FROM params"
+                        ).fetchall()
+                    ]
             applied = []
-            for key, raw in rows:
-                if key in EDITABLE_PARAMS:
-                    merged[key] = json.loads(raw)
+            for key, raw_tf, raw in rows:
+                if key not in EDITABLE_PARAMS:
+                    continue
+                value = json.loads(raw)
+                tf = Timeframe.try_parse(raw_tf) if raw_tf else None
+                if tf is None:
+                    merged[key] = value
                     applied.append(key)
+                else:
+                    layers.setdefault(tf, {})[key] = value
+                    applied.append(f"{tf.value}:{key}")
             if applied:
                 print(f"Из state.db подтянуты правки /params: {', '.join(applied)}",
                       file=sys.stderr)
         except sqlite3.Error as exc:
             print(f"state.db не прочитан ({exc})", file=sys.stderr)
 
-    merged.update(overrides)
-    return ParamsConfig.model_validate(merged)
+    merged.update(overrides.get(None, {}))
+    for tf, values in overrides.items():
+        if tf is not None:
+            layers.setdefault(tf, {}).update(values)
+
+    return ParamsConfig.model_validate(merged), layers
+
+
+def resolve_params(base, layers: dict, tf: Timeframe):
+    """Собранный конфиг таймфрейма — тем же build_params(), что и в боте."""
+    from app.config import build_params
+
+    return build_params(base, layers.get(tf))
 
 
 def parse_assignments(items: list[str]) -> dict:
+    """key=value → {None: {...}}; 1D:key=value → {Timeframe.D1: {...}}."""
     out: dict = {}
     for item in items:
         if "=" not in item:
-            raise SystemExit(f"Ожидал key=value, получил: {item}")
-        key, raw = item.split("=", 1)
-        out[key.strip()] = _coerce(raw.strip())
+            raise SystemExit(f"Ожидал key=value или TF:key=value, получил: {item}")
+        left, raw = item.split("=", 1)
+        left = left.strip()
+        tf: Timeframe | None = None
+        if ":" in left:
+            raw_tf, left = left.split(":", 1)
+            tf = Timeframe.try_parse(raw_tf.strip())
+            if tf is None:
+                raise SystemExit(f"Неизвестный таймфрейм в --param: {raw_tf}")
+        out.setdefault(tf, {})[left.strip()] = _coerce(raw.strip())
     return out
 
 
@@ -297,10 +346,46 @@ def _coerce(raw: str):
 # --- прогон и отчёт ---------------------------------------------------------
 
 
-def run_one(symbol: str, tf: Timeframe, df: pd.DataFrame, params) -> list[Trade]:
+def run_one(
+    symbol: str, tf: Timeframe, df: pd.DataFrame, params
+) -> tuple[list[Trade], list]:
+    """(сделки, сигналы). Сигналы нужны для аудита расхождений между прогонами."""
     engine = DivergenceEngine(params.to_signal_params())
     result = engine.analyze(df, symbol, tf)
-    return evaluate(df, result.signals, timeout_bars=params.outcome_timeout_bars)
+    trades = evaluate(df, result.signals, timeout_bars=params.outcome_timeout_bars)
+    return trades, result.signals
+
+
+def signal_row(signal) -> dict:
+    """Строка выгрузки сигналов. Набор колонок зафиксирован приёмкой:
+    сравнение двух прогонов делается обычным диффом двух CSV."""
+    return {
+        "symbol": signal.symbol,
+        "timeframe": signal.timeframe.value,
+        "alert_type": signal.type.value,
+        "candle_time": signal.candle_time.isoformat(),
+        "price": signal.price,
+        "rsi": round(signal.rsi, 4),
+        "degree": signal.degree,
+        "replaced_from": (
+            "" if signal.replaced_from is None else signal.replaced_from
+        ),
+    }
+
+
+def dump_signals(path: str, signals: list) -> None:
+    if not signals:
+        print("Нечего выгружать: сигналов нет", file=sys.stderr)
+        return
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rows = [signal_row(s) for s in signals]
+    rows.sort(key=lambda r: (r["symbol"], r["timeframe"], r["candle_time"], r["alert_type"]))
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Выгружено сигналов: {len(rows)} → {target}")
 
 
 def _pct(value: float | None, width: int = 7) -> str:
@@ -402,6 +487,66 @@ def print_sweep(rows: list[tuple[dict, dict]], keys: list[str]) -> None:
     )
 
 
+def print_signal_summary(signals: list) -> None:
+    """Сводка по сигналам + проверка приёмочного утверждения 2.
+
+    Утверждение проверяется ТОЛЬКО для тех ALERT #1, что пришли при живой
+    цепочке (у них заполнен displaced_anchor). Для ALERT #1 на пустой цепочке
+    ограничения по цене нет и быть не должно: сравнивать было не с чем.
+    """
+    if not signals:
+        return
+    by_type: dict[str, int] = {}
+    for signal in signals:
+        by_type[signal.type.value] = by_type.get(signal.type.value, 0) + 1
+
+    print("\n=== сигналы ===")
+    for name in sorted(by_type):
+        print(f"  {name:<22} {by_type[name]}")
+
+    displacements = [s for s in signals if s.displaced_anchor is not None]
+    fresh_starts = [
+        s for s in signals
+        if s.displaced_anchor is None and s.degree == 1 and s.reference is None
+        and s.type.value in {"oversold_pivot", "overbought_pivot"}
+    ]
+    replacements = [s for s in signals if s.replaced_from is not None]
+    print(
+        f"  из них ALERT #1 с вытеснением опорной: {len(displacements)}, "
+        f"на пустой цепочке: {len(fresh_starts)}"
+    )
+    print(f"  ALERT #2, являющихся заменой точки:    {len(replacements)}")
+
+    violations = []
+    for signal in displacements:
+        anchor = signal.displaced_anchor
+        broke = (
+            signal.price < anchor.price
+            if signal.direction.value == "bull"
+            else signal.price > anchor.price
+        )
+        if not broke:
+            violations.append(signal)
+
+    if violations:
+        print(
+            f"  !! УТВЕРЖДЕНИЕ 2 НАРУШЕНО: {len(violations)} ALERT #1 вытеснили "
+            f"опорную, не обновив её цену — это баг"
+        )
+        for signal in violations[:10]:
+            anchor = signal.displaced_anchor
+            print(
+                f"     {signal.symbol} {signal.timeframe.value} "
+                f"{signal.candle_time.isoformat()}: цена {signal.price} "
+                f"против опорной {anchor.price}"
+            )
+    else:
+        print(
+            "  утверждение 2: OK — каждый ALERT #1, вытеснивший живую опорную, "
+            "обновил её цену"
+        )
+
+
 def dump_csv(path: str, trades: list[Trade]) -> None:
     if not trades:
         print("Нечего выгружать: сделок нет", file=sys.stderr)
@@ -435,25 +580,36 @@ def main() -> None:
     parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--sweep", action="append", default=[], metavar="KEY=V1,V2")
     parser.add_argument("--csv", default="")
+    parser.add_argument(
+        "--signals-csv", dest="signals_csv", default="",
+        help="выгрузить ВСЕ сигналы (не только сделки) для аудита расхождений",
+    )
     args = parser.parse_args()
 
     overrides = parse_assignments(args.param)
-    params = load_params(args.config, None if args.no_db_params else args.db, overrides)
+    base_params, layers = load_params(
+        args.config, None if args.no_db_params else args.db, overrides
+    )
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     if not symbols:
         symbols = _symbols_from_config(args.config)
     timeframes = [Timeframe.parse(chunk) for chunk in args.timeframes.split(",") if chunk.strip()]
 
-    print(
-        f"Пороги: RSI({params.rsi_period}), fractal_n={params.fractal_n}, "
-        f"oversold={params.oversold:g}, div_max={params.divergence_rsi_max:g}, "
-        f"max_bars_between={params.max_bars_between}, "
-        f"chain_max_points={params.chain_max_points}, "
-        f"bearish={'вкл' if params.bearish_enabled else 'выкл'}, "
-        f"timeout={params.outcome_timeout_bars}",
-        file=sys.stderr,
-    )
+    for tf in timeframes:
+        params = resolve_params(base_params, layers, tf)
+        print(
+            f"Пороги {tf.value}: RSI({params.rsi_period}), "
+            f"fractal_n={params.fractal_n}, oversold={params.oversold:g}, "
+            f"div_max={params.divergence_rsi_max:g}, "
+            f"anchor_ttl={params.anchor_ttl_bars}, "
+            f"max_between={params.max_bars_between_points}, "
+            f"min_between={params.min_bars_between_points}, "
+            f"chain_max_points={params.chain_max_points}, "
+            f"bearish={'вкл' if params.bearish_enabled else 'выкл'}, "
+            f"timeout={params.outcome_timeout_bars}",
+            file=sys.stderr,
+        )
 
     history: dict[tuple[str, Timeframe], pd.DataFrame] = {}
     for symbol in symbols:
@@ -472,24 +628,31 @@ def main() -> None:
         rows: list[tuple[dict, dict]] = []
         for combo_values in itertools.product(*(sweep[key] for key in keys)):
             combo = dict(zip(keys, combo_values))
-            candidate = params.model_copy(update=combo)
             trades: list[Trade] = []
             for (symbol, tf), df in history.items():
                 if len(df) < 60:
                     continue
-                trades += run_one(symbol, tf, df, candidate)
+                candidate = resolve_params(base_params, layers, tf).model_copy(
+                    update=combo
+                )
+                trades += run_one(symbol, tf, df, candidate)[0]
             rows.append((combo, aggregate(trades)))
         print_sweep(rows, keys)
         return
 
     all_trades: list[Trade] = []
+    all_signals: list = []
     for (symbol, tf), df in history.items():
         if len(df) < 60:
             print(f"\n=== {symbol} · {tf.value} === мало данных ({len(df)} баров)")
             continue
-        trades = run_one(symbol, tf, df, params)
+        params = resolve_params(base_params, layers, tf)
+        trades, signals = run_one(symbol, tf, df, params)
         all_trades += trades
+        all_signals += signals
         print_report(symbol, tf, df, trades)
+
+    print_signal_summary(all_signals)
 
     if len(history) > 1:
         total = aggregate(all_trades)
@@ -503,6 +666,8 @@ def main() -> None:
 
     if args.csv:
         dump_csv(args.csv, all_trades)
+    if args.signals_csv:
+        dump_signals(args.signals_csv, all_signals)
 
 
 def _symbols_from_config(config_path: str) -> list[str]:
