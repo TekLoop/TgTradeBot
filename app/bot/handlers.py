@@ -15,7 +15,7 @@ from app.analysis.signals import Direction
 from app.bot.formatting import format_history, format_stats, format_status_line
 from app.bot.scheduler import Scheduler
 from app.bot.storage import Storage, TrackingUnit
-from app.config import EDITABLE_PARAMS, ParamsConfig, Secrets
+from app.config import EDITABLE_PARAMS, Secrets
 from app.core.timeframes import ALL_TIMEFRAMES, Timeframe
 from app.service import TrackingService
 
@@ -33,6 +33,8 @@ HELP_TEXT = """<b>RSI Divergence Bot</b>
 /stats [symbol] [tf] — что было с ценой после дивергенций
 /history [symbol] [N] — последние закрытые записи
 /params — показать пороги; <code>/params oversold 28</code> — изменить
+    на таймфрейм: <code>/params 1D anchor_ttl_bars 60</code>
+    снять: <code>/params reset 1D anchor_ttl_bars</code>
 /help — эта справка
 
 Таймфреймы: {timeframes}
@@ -241,16 +243,17 @@ class BotHandlers:
             return_exceptions=True,
         )
 
-        params = await self.service.effective_params()
         lines = [f"<b>{escape(symbol)}</b> [{escape(asset.provider)}]", ""]
         for unit, outcome in zip(units, outcomes):
             if isinstance(outcome, BaseException):
-                lines.append(format_status_line(unit.timeframe.value, None, None, None, None, str(outcome)))
+                lines.append(
+                    format_status_line(unit.timeframe, None, None, None, None, str(outcome))
+                )
                 continue
             if outcome.error or outcome.result is None:
                 lines.append(
                     format_status_line(
-                        unit.timeframe.value, None, None, None, None,
+                        unit.timeframe, None, None, None, None,
                         outcome.error or "нет данных",
                     )
                 )
@@ -258,18 +261,20 @@ class BotHandlers:
             anchor = await self.storage.get_anchor(symbol, unit.timeframe, Direction.BULL)
             lines.append(
                 format_status_line(
-                    unit.timeframe.value,
+                    unit.timeframe,
                     outcome.result.last_price,
                     outcome.result.last_rsi,
                     outcome.result.last_candle_time,
                     anchor,
                 )
             )
+        params = await self.service.effective_params(units[0].timeframe)
         lines += [
             "",
             f"<i>RSI({params.rsi_period}), фрактал N={params.fractal_n}, "
             f"oversold={params.oversold:g}, div_max={params.divergence_rsi_max:g}, "
-            f"цепочка до {params.chain_max_points} точек</i>",
+            f"цепочка до {params.chain_max_points} точек "
+            f"(пороги показаны для {units[0].timeframe.value})</i>",
         ]
         await self._reply(update, "\n".join(lines))
 
@@ -315,25 +320,27 @@ class BotHandlers:
     async def cmd_params(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
             return
-        args = context.args or []
-        params = await self.service.effective_params()
+        args = list(context.args or [])
 
         if not args:
-            lines = ["<b>Текущие пороги</b>", ""]
-            for key in EDITABLE_PARAMS:
-                lines.append(f"<code>{key}</code> = <b>{getattr(params, key)}</b>")
-            lines += ["", "Изменить: <code>/params oversold 28</code>",
-                      "Сбросить всё к config.yaml: <code>/params reset</code>"]
-            await self._reply(update, "\n".join(lines))
+            await self._reply(update, await self._render_params())
             return
 
         if args[0].lower() == "reset":
-            await self.storage.clear_params()
-            await self._reply(update, "Пороги сброшены к значениям из config.yaml")
+            await self._params_reset(update, args[1:])
             return
 
+        # /params <TF> <key> <value> — таймфрейм необязателен и идёт первым.
+        tf = Timeframe.try_parse(args[0]) if args else None
+        if tf is not None:
+            args = args[1:]
+
         if len(args) < 2:
-            await self._reply(update, "Формат: <code>/params &lt;ключ&gt; &lt;значение&gt;</code>")
+            await self._reply(
+                update,
+                "Формат: <code>/params &lt;ключ&gt; &lt;значение&gt;</code> "
+                "или <code>/params &lt;ТФ&gt; &lt;ключ&gt; &lt;значение&gt;</code>",
+            )
             return
 
         key = args[0].strip()
@@ -346,20 +353,82 @@ class BotHandlers:
             return
 
         value = _coerce(args[1])
-        candidate = params.model_dump()
-        candidate[key] = value
-        try:
-            ParamsConfig.model_validate(candidate)
-        except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Некорректное значение: {escape(str(exc)[:300])}")
+
+        # Кандидат-конфиг собирается ЦЕЛИКОМ и прогоняется через полную
+        # валидацию. При отказе в БД не пишется ничего.
+        problem = await self.service.validate_override(key, value, tf)
+        if problem:
+            await self._reply(update, f"Некорректное значение: {escape(problem[:400])}")
             return
 
-        await self.storage.set_param(key, value)
+        was = getattr(await self.service.effective_params(tf), key)
+        await self.storage.set_param(key, value, tf)
+        scope = f" · {tf.value}" if tf else " · глобально"
         await self._reply(
             update,
-            f"<code>{escape(key)}</code>: {getattr(params, key)} → <b>{value}</b>\n"
+            f"<code>{escape(key)}</code>{escape(scope)}: {was} → <b>{value}</b>\n"
             f"<i>Применится при следующем опросе.</i>",
         )
+
+    async def _params_reset(self, update: Update, rest: list[str]) -> None:
+        """/params reset — всё; /params reset <TF> — весь оверлей таймфрейма;
+        /params reset <TF> <key> и /params reset <key> — один оверрайд."""
+        if not rest:
+            await self.storage.clear_params()
+            await self._reply(update, "Пороги сброшены к значениям из config.yaml")
+            return
+
+        tf = Timeframe.try_parse(rest[0])
+        if tf is not None:
+            rest = rest[1:]
+            if not rest:
+                await self.storage.clear_params(tf)
+                await self._reply(update, f"Оверрайды {tf.value} сняты")
+                return
+
+        key = rest[0].strip()
+        if key not in EDITABLE_PARAMS:
+            await self._reply(update, f"Неизвестный параметр: <code>{escape(key)}</code>")
+            return
+        removed = await self.storage.reset_param(key, tf)
+        scope = tf.value if tf else "глобально"
+        await self._reply(
+            update,
+            f"<code>{escape(key)}</code> · {escape(scope)}: "
+            f"{'оверрайд снят' if removed else 'оверрайда не было'}",
+        )
+
+    async def _render_params(self) -> str:
+        """Сначала база, затем блоки по таймфреймам — только отличия от базы."""
+        base = await self.service.effective_params(None)
+        lines = ["<b>Текущие пороги</b> (база)", ""]
+        for key in EDITABLE_PARAMS:
+            lines.append(f"<code>{key}</code> = <b>{getattr(base, key)}</b>")
+
+        for tf in await self.service.configured_timeframes():
+            resolved = await self.service.effective_params(tf)
+            diff = [
+                (key, getattr(resolved, key))
+                for key in EDITABLE_PARAMS
+                if getattr(resolved, key) != getattr(base, key)
+            ]
+            if not diff:
+                continue
+            lines += ["", f"<b>{tf.value}</b> — отличия от базы"]
+            for key, value in diff:
+                lines.append(
+                    f"<code>{key}</code> = <b>{value}</b> "
+                    f"<i>(база: {getattr(base, key)})</i>"
+                )
+
+        lines += [
+            "",
+            "Глобально: <code>/params oversold 28</code>",
+            "На таймфрейм: <code>/params 1D anchor_ttl_bars 60</code>",
+            "Снять: <code>/params reset 1D anchor_ttl_bars</code>",
+            "Сбросить всё к config.yaml: <code>/params reset</code>",
+        ]
+        return "\n".join(lines)
 
     # --- служебное ----------------------------------------------------------
 
