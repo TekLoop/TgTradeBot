@@ -1,4 +1,5 @@
-"""Telegram-интерфейс: /start, /list, /add, /remove, /tf, /status, /params."""
+"""Telegram-интерфейс: /start, /list, /add, /remove, /tf, /status, /params,
+/stats, /history."""
 
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.analysis.signals import Direction
-from app.bot.formatting import format_status_line
+from app.bot.formatting import format_history, format_stats, format_status_line
 from app.bot.scheduler import Scheduler
 from app.bot.storage import Storage, TrackingUnit
 from app.config import EDITABLE_PARAMS, ParamsConfig, Secrets
@@ -29,6 +30,8 @@ HELP_TEXT = """<b>RSI Divergence Bot</b>
 /tf &lt;symbol&gt; &lt;timeframe&gt; on|off — включить/выключить ТФ
     пример: <code>/tf HYPEUSDT 3H on</code>
 /status &lt;symbol&gt; — цена, RSI и опорные точки по всем ТФ
+/stats [symbol] [tf] — что было с ценой после дивергенций
+/history [symbol] [N] — последние закрытые записи
 /params — показать пороги; <code>/params oversold 28</code> — изменить
 /help — эта справка
 
@@ -59,6 +62,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("remove", self.cmd_remove))
         app.add_handler(CommandHandler("tf", self.cmd_tf))
         app.add_handler(CommandHandler("status", self.cmd_status))
+        app.add_handler(CommandHandler("stats", self.cmd_stats))
+        app.add_handler(CommandHandler("history", self.cmd_history))
         app.add_handler(CommandHandler("params", self.cmd_params))
         app.add_error_handler(self.on_error)
 
@@ -263,9 +268,49 @@ class BotHandlers:
         lines += [
             "",
             f"<i>RSI({params.rsi_period}), фрактал N={params.fractal_n}, "
-            f"oversold={params.oversold:g}, div_max={params.divergence_rsi_max:g}</i>",
+            f"oversold={params.oversold:g}, div_max={params.divergence_rsi_max:g}, "
+            f"цепочка до {params.chain_max_points} точек</i>",
         ]
         await self._reply(update, "\n".join(lines))
+
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        symbol, timeframe, bad = _parse_filters(context.args or [])
+        if bad:
+            await self._reply(update, f"Неизвестный аргумент: {escape(bad)}")
+            return
+
+        store = self.service.outcomes
+        closed = await store.list_closed(symbol, timeframe, limit=1000)
+        open_records = await store.list_open(symbol, timeframe)
+
+        header = symbol or "Все активы"
+        if timeframe is not None:
+            header = f"{header} · {timeframe.value}"
+        await self._reply(update, format_stats(closed, open_records, header))
+
+    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        args = list(context.args or [])
+        limit = 10
+        rest: list[str] = []
+        for arg in args:
+            if arg.isdigit():
+                limit = max(1, min(int(arg), 30))
+            else:
+                rest.append(arg)
+        symbol, timeframe, bad = _parse_filters(rest)
+        if bad:
+            await self._reply(update, f"Неизвестный аргумент: {escape(bad)}")
+            return
+
+        records = await self.service.outcomes.list_closed(symbol, timeframe, limit=limit)
+        header = symbol or "Все активы"
+        if timeframe is not None:
+            header = f"{header} · {timeframe.value}"
+        await self._reply(update, format_history(records, f"История · {header}"))
 
     async def cmd_params(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
@@ -331,9 +376,43 @@ class BotHandlers:
         message = update.effective_message
         if message is None:
             return
-        await message.reply_text(
-            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-        )
+        # Telegram режет сообщения длиннее 4096 символов.
+        for chunk in _split(text, 4000):
+            await message.reply_text(
+                chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            )
+
+
+def _split(text: str, size: int) -> list[str]:
+    if len(text) <= size:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in text.split("\n"):
+        if length + len(line) + 1 > size and current:
+            chunks.append("\n".join(current))
+            current, length = [], 0
+        current.append(line)
+        length += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _parse_filters(args: list[str]) -> tuple[str | None, Timeframe | None, str | None]:
+    """Разбирает необязательные [symbol] [timeframe] в любом порядке."""
+    symbol: str | None = None
+    timeframe: Timeframe | None = None
+    for arg in args:
+        tf = Timeframe.try_parse(arg)
+        if tf is not None and timeframe is None:
+            timeframe = tf
+        elif symbol is None:
+            symbol = arg.upper()
+        else:
+            return symbol, timeframe, arg
+    return symbol, timeframe, None
 
 
 def _coerce(raw: str):

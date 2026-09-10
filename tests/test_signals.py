@@ -13,6 +13,7 @@ from tests.synthetic import (
     invalidation_df,
     make_prices,
     no_divergence_df,
+    triple_df,
     uptrend_df,
 )
 
@@ -27,12 +28,16 @@ def types_of(result) -> list[AlertType]:
     return [s.type for s in result.signals]
 
 
+def divergences_of(result):
+    return [s for s in result.signals if s.type is AlertType.BULLISH_DIVERGENCE]
+
+
 def test_divergence_is_detected():
     """Ряд, где дивергенция заведомо ЕСТЬ: цена обновила минимум, RSI — нет."""
     result = analyze(divergence_df())
 
     assert AlertType.OVERSOLD_PIVOT in types_of(result)
-    divergences = [s for s in result.signals if s.type is AlertType.BULLISH_DIVERGENCE]
+    divergences = divergences_of(result)
     assert len(divergences) == 1
 
     signal = divergences[0]
@@ -40,11 +45,70 @@ def test_divergence_is_detected():
     assert signal.price < signal.reference.price      # цена ниже
     assert signal.rsi > signal.reference.rsi          # RSI выше
     assert signal.rsi <= PARAMS.divergence_rsi_max    # всё ещё в нижней зоне
-    assert signal.reference.rsi <= PARAMS.oversold    # опорная точка перепродана
+    assert signal.reference.rsi <= PARAMS.oversold    # первая точка перепродана
     assert signal.price_delta < 0
     assert signal.rsi_delta > 0
-    # после ALERT #2 опорная точка сброшена
+    assert signal.degree == 2
+    # цепочка не сброшена: третья точка может её продлить
+    assert len(result.bull_chain) == 2
+    assert result.bull_anchor is not None
+    assert result.bull_anchor.time == signal.candle_time
+
+
+def test_chain_max_points_two_reproduces_old_behaviour():
+    """chain_max_points=2 — прежний автомат: после ALERT #2 цепочка обнуляется."""
+    result = analyze(divergence_df(), SignalParams(chain_max_points=2))
+
+    assert len(divergences_of(result)) == 1
+    assert result.bull_chain == ()
     assert result.bull_anchor is None
+
+
+def test_triple_divergence_is_detected():
+    """Третий минимум продлевает цепочку: цена ниже, RSI выше предыдущей точки."""
+    result = analyze(triple_df())
+    divergences = divergences_of(result)
+
+    assert [s.degree for s in divergences] == [2, 3]
+    second, third = divergences
+    assert third.candle_time > second.candle_time
+    assert third.price < second.price       # цена продолжила обновлять минимум
+    assert third.rsi > second.rsi           # RSI продолжил расти
+    assert len(third.chain) == 3
+    assert third.reference is not None
+    assert third.reference.time == second.candle_time
+    # цепочка целиком: цена монотонно вниз, RSI монотонно вверх
+    prices = [p.price for p in third.chain]
+    rsis = [p.rsi for p in third.chain]
+    assert prices == sorted(prices, reverse=True)
+    assert rsis == sorted(rsis)
+
+
+def test_triple_not_reported_when_chain_capped_at_two():
+    result = analyze(triple_df(), SignalParams(chain_max_points=2))
+    assert all(s.degree <= 2 for s in result.signals)
+
+
+def test_confirmation_price_is_close_of_confirming_candle():
+    """Цена входа для статистики = close свечи, подтвердившей фрактал."""
+    df = divergence_df()
+    signal = divergences_of(analyze(df))[0]
+
+    pivot_pos = int(df.index[df["open_time"] == signal.candle_time][0])
+    confirm_pos = pivot_pos + PARAMS.fractal_n
+
+    assert signal.confirmation_time == df["open_time"].iloc[confirm_pos].to_pydatetime()
+    assert signal.confirmation_price == pytest.approx(df["close"].iloc[confirm_pos])
+
+
+def test_confirmation_price_is_none_before_confirmation():
+    """Пока справа не хватает баров, входа ещё нет."""
+    df = divergence_df()
+    signal = divergences_of(analyze(df))[0]
+    pivot_pos = int(df.index[df["open_time"] == signal.candle_time][0])
+
+    truncated = df.iloc[: pivot_pos + PARAMS.fractal_n]
+    assert AlertType.BULLISH_DIVERGENCE not in types_of(analyze(truncated))
 
 
 def test_alert1_precedes_alert2_and_points_match():
@@ -53,6 +117,7 @@ def test_alert1_precedes_alert2_and_points_match():
     alert2 = next(s for s in result.signals if s.type is AlertType.BULLISH_DIVERGENCE)
 
     assert alert1.candle_time < alert2.candle_time
+    assert alert1.degree == 1
     assert alert2.reference is not None
     assert alert2.reference.time == alert1.candle_time
     assert alert2.reference.price == pytest.approx(alert1.price)
@@ -79,7 +144,7 @@ def test_anchor_invalidated_when_rsi_crosses_reset_level():
     result = analyze(df)
 
     assert AlertType.BULLISH_DIVERGENCE not in types_of(result)
-    # второй минимум сам по себе перепродан → он становится новой опорной точкой
+    # второй минимум сам по себе перепродан → он начинает новую цепочку
     alerts1 = [s for s in result.signals if s.type is AlertType.OVERSOLD_PIVOT]
     assert len(alerts1) == 2
     assert alerts1[1].price < alerts1[0].price
@@ -136,6 +201,7 @@ def test_bearish_mirror_logic():
     assert signal.reference is not None
     assert signal.price > signal.reference.price   # цена обновила максимум
     assert signal.rsi < signal.reference.rsi       # RSI максимум не обновил
+    assert signal.degree == 2
 
 
 def test_short_series_returns_nothing():

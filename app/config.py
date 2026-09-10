@@ -31,8 +31,10 @@ class ParamsConfig(BaseModel):
     reset_rsi_bear: float = Field(50.0, ge=0, le=100)
     max_bars_between: int = Field(40, ge=2, le=1000)
     bearish_enabled: bool = False
+    chain_max_points: int = Field(4, ge=2, le=9)
     lookback_bars: int = Field(300, ge=60, le=1000)
     notify_max_age_bars: int = Field(3, ge=0, le=50)
+    outcome_timeout_bars: int = Field(120, ge=0, le=5000)
 
     @model_validator(mode="after")
     def _check_zones(self) -> "ParamsConfig":
@@ -54,6 +56,7 @@ class ParamsConfig(BaseModel):
             reset_rsi_bear=self.reset_rsi_bear,
             max_bars_between=self.max_bars_between,
             bearish_enabled=self.bearish_enabled,
+            chain_max_points=self.chain_max_points,
         )
 
 

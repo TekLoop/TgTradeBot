@@ -10,8 +10,12 @@
   * повторная отправка исключается на уровне БД по ключу
     (symbol, timeframe, alert_type, candle_time).
 
-Опорная точка (anchor) всё равно сохраняется в БД — но только для /status
-и для наглядности, логика от неё не зависит.
+ЦЕПОЧКИ ТОЧЕК. Вместо одной опорной точки движок держит цепочку экстремумов.
+Каждый следующий подтверждённый фрактал продлевает её, если цена обновила
+экстремум предыдущей точки, а RSI — нет. Степень сигнала (degree) равна числу
+точек в цепочке: 2 — обычная дивергенция, 3 и больше — тройная и глубже.
+Цепочка обнуляется при достижении chain_max_points, при инвалидации по RSI
+и по max_bars_between. chain_max_points=2 воспроизводит прежнее поведение.
 """
 
 from __future__ import annotations
@@ -36,6 +40,12 @@ class AlertType(str, Enum):
     BEARISH_DIVERGENCE = "bearish_divergence"  # ALERT #2 (медвежий сценарий)
 
 
+#: Типы, по которым заводится запись статистики (см. app/bot/storage.py).
+DIVERGENCE_TYPES = frozenset(
+    {AlertType.BULLISH_DIVERGENCE, AlertType.BEARISH_DIVERGENCE}
+)
+
+
 class Direction(str, Enum):
     BULL = "bull"
     BEAR = "bear"
@@ -52,10 +62,11 @@ class SignalParams:
     overbought: float = 70.0
     divergence_rsi_max: float = 35.0   # верхняя граница RSI для бычьей дивергенции
     divergence_rsi_min: float = 65.0   # нижняя граница RSI для медвежьей дивергенции
-    reset_rsi: float = 50.0            # инвалидация бычьей опорной точки (RSI выше)
-    reset_rsi_bear: float = 50.0       # инвалидация медвежьей опорной точки (RSI ниже)
+    reset_rsi: float = 50.0            # инвалидация бычьей цепочки (RSI выше)
+    reset_rsi_bear: float = 50.0       # инвалидация медвежьей цепочки (RSI ниже)
     max_bars_between: int = 40
     bearish_enabled: bool = False
+    chain_max_points: int = 4          # максимум точек в цепочке (2 = как раньше)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +94,13 @@ class Signal:
     rsi: float
     candle_time: datetime               # open_time свечи-экстремума = ключ дедупликации
     direction: Direction = Direction.BULL
-    reference: PivotPoint | None = None  # первая точка (для ALERT #2)
-    pivot: PivotPoint | None = None      # вторая (текущая) точка
+    reference: PivotPoint | None = None  # предыдущая точка цепочки (для ALERT #2+)
+    pivot: PivotPoint | None = None      # текущая точка
     confirmation_time: datetime | None = None  # open_time свечи, подтвердившей фрактал
+    confirmation_price: float | None = None    # close той же свечи = «цена входа»
     bars_since_confirmation: int = 0     # 0 = подтверждено на последней закрытой свече
+    degree: int = 1                      # число точек в цепочке: 2 — обычная дивергенция
+    chain: tuple[PivotPoint, ...] = ()   # вся цепочка целиком (для сообщения)
 
     @property
     def price_delta(self) -> float | None:
@@ -106,14 +120,20 @@ class Signal:
             return None
         return self.pivot.rsi - self.reference.rsi
 
+    @property
+    def is_divergence(self) -> bool:
+        return self.type in DIVERGENCE_TYPES
+
 
 @dataclass(frozen=True, slots=True)
 class AnalysisResult:
     symbol: str
     timeframe: Timeframe
     signals: list[Signal] = field(default_factory=list)
-    bull_anchor: PivotPoint | None = None
+    bull_anchor: PivotPoint | None = None       # последняя точка бычьей цепочки
     bear_anchor: PivotPoint | None = None
+    bull_chain: tuple[PivotPoint, ...] = ()
+    bear_chain: tuple[PivotPoint, ...] = ()
     last_price: float | None = None
     last_rsi: float | None = None
     last_candle_time: datetime | None = None
@@ -133,7 +153,7 @@ class _Rules:
     price_broke: Callable[[float, float], bool]
     rsi_diverged: Callable[[float, float], bool]
     rsi_in_zone: Callable[[float], bool]     # зона для ALERT #2
-    is_reset: Callable[[float], bool]        # инвалидация опорной точки
+    is_reset: Callable[[float], bool]        # инвалидация цепочки
 
 
 def _bull_rules(p: SignalParams) -> _Rules:
@@ -170,7 +190,7 @@ REQUIRED_COLUMNS = ("open_time", "open", "high", "low", "close", "volume")
 
 
 class DivergenceEngine:
-    """Конечный автомат ALERT #1 → ALERT #2 с инвалидацией опорной точки."""
+    """Конечный автомат ALERT #1 → ALERT #2 → ALERT #3… с инвалидацией цепочки."""
 
     def __init__(self, params: SignalParams) -> None:
         self.params = params
@@ -193,19 +213,20 @@ class DivergenceEngine:
 
         df = df.reset_index(drop=True)
         rsi_vals = rsi_indicator(df["close"], p.rsi_period).to_numpy(dtype=float)
+        closes = df["close"].to_numpy(dtype=float)
         times = pd.DatetimeIndex(
             pd.to_datetime(df["open_time"], utc=True)
         ).to_pydatetime()
         last_idx = len(df) - 1
 
         signals: list[Signal] = []
-        bull_anchor = self._scan(
-            df, rsi_vals, times, symbol, timeframe, _bull_rules(p), signals
+        bull_chain = self._scan(
+            df, rsi_vals, closes, times, symbol, timeframe, _bull_rules(p), signals
         )
-        bear_anchor = None
+        bear_chain: list[PivotPoint] = []
         if p.bearish_enabled:
-            bear_anchor = self._scan(
-                df, rsi_vals, times, symbol, timeframe, _bear_rules(p), signals
+            bear_chain = self._scan(
+                df, rsi_vals, closes, times, symbol, timeframe, _bear_rules(p), signals
             )
 
         signals.sort(key=lambda s: (s.candle_time, s.type.value))
@@ -215,9 +236,11 @@ class DivergenceEngine:
             symbol=symbol,
             timeframe=timeframe,
             signals=signals,
-            bull_anchor=bull_anchor,
-            bear_anchor=bear_anchor,
-            last_price=float(df["close"].iloc[last_idx]),
+            bull_anchor=bull_chain[-1] if bull_chain else None,
+            bear_anchor=bear_chain[-1] if bear_chain else None,
+            bull_chain=tuple(bull_chain),
+            bear_chain=tuple(bear_chain),
+            last_price=float(closes[last_idx]),
             last_rsi=last_rsi,
             last_candle_time=times[last_idx],
             bars=len(df),
@@ -229,32 +252,33 @@ class DivergenceEngine:
         self,
         df: pd.DataFrame,
         rsi_vals: np.ndarray,
+        closes: np.ndarray,
         times,
         symbol: str,
         timeframe: Timeframe,
         rules: _Rules,
         signals: list[Signal],
-    ) -> PivotPoint | None:
+    ) -> list[PivotPoint]:
         p = self.params
         n = p.fractal_n
         last_idx = len(df) - 1
         price_arr = df[rules.price_source].to_numpy(dtype=float)
         pivot_indices = set(rules.pivots(price_arr, n))
 
-        anchor: PivotPoint | None = None
+        chain: list[PivotPoint] = []
 
         for i in range(len(df)):
             r = rsi_vals[i]
             if np.isnan(r):
                 continue  # прогрев RSI
 
-            # 1. Протухание опорной точки по времени.
-            if anchor is not None and i - anchor.index > p.max_bars_between:
-                anchor = None
+            # 1. Протухание цепочки по времени (считаем от последней её точки).
+            if chain and i - chain[-1].index > p.max_bars_between:
+                chain = []
 
-            # 2. Инвалидация по RSI (бары строго после опорной точки).
-            if anchor is not None and i > anchor.index and rules.is_reset(float(r)):
-                anchor = None
+            # 2. Инвалидация по RSI (бары строго после последней точки).
+            if chain and i > chain[-1].index and rules.is_reset(float(r)):
+                chain = []
 
             if i not in pivot_indices:
                 continue
@@ -267,45 +291,52 @@ class DivergenceEngine:
             )
             confirm_idx = i + n  # фрактал подтверждается через N баров
 
-            if anchor is None:
+            if not chain:
                 if rules.is_extreme_rsi(point.rsi):
-                    anchor = point
+                    chain = [point]
                     signals.append(
                         self._make_signal(
                             symbol, timeframe, rules.alert1, rules.direction,
-                            point, None, times, confirm_idx, last_idx,
+                            point, None, times, closes, confirm_idx, last_idx,
+                            1, tuple(chain),
                         )
                     )
                 continue
 
-            # Есть опорная точка → проверяем дивергенцию.
+            prev = chain[-1]
             is_divergence = (
-                rules.price_broke(point.price, anchor.price)
-                and rules.rsi_diverged(point.rsi, anchor.rsi)
+                rules.price_broke(point.price, prev.price)
+                and rules.rsi_diverged(point.rsi, prev.rsi)
                 and rules.rsi_in_zone(point.rsi)
-                and (point.index - anchor.index) <= p.max_bars_between
+                and (point.index - prev.index) <= p.max_bars_between
             )
             if is_divergence:
+                chain.append(point)
                 signals.append(
                     self._make_signal(
                         symbol, timeframe, rules.alert2, rules.direction,
-                        point, anchor, times, confirm_idx, last_idx,
+                        point, prev, times, closes, confirm_idx, last_idx,
+                        len(chain), tuple(chain),
                     )
                 )
-                anchor = None  # после ALERT #2 опорная точка сбрасывается
-            elif rules.is_extreme_rsi(point.rsi):
-                # Дивергенции нет, но новый экстремум сам по себе в зоне
-                # перепроданности/перекупленности → он становится новой опорной точкой.
-                anchor = point
+                if len(chain) >= p.chain_max_points:
+                    chain = []   # цепочка дошла до потолка — начинаем заново
+                continue
+
+            if rules.is_extreme_rsi(point.rsi):
+                # Продлить не вышло, но точка сама по себе в зоне
+                # перепроданности/перекупленности → начинаем цепочку с неё.
+                chain = [point]
                 signals.append(
                     self._make_signal(
                         symbol, timeframe, rules.alert1, rules.direction,
-                        point, None, times, confirm_idx, last_idx,
+                        point, None, times, closes, confirm_idx, last_idx,
+                        1, tuple(chain),
                     )
                 )
-            # иначе — опорная точка сохраняется, ждём следующий фрактал
+            # иначе — цепочка сохраняется, ждём следующий фрактал
 
-        return anchor
+        return chain
 
     @staticmethod
     def _make_signal(
@@ -316,10 +347,13 @@ class DivergenceEngine:
         point: PivotPoint,
         reference: PivotPoint | None,
         times,
+        closes: np.ndarray,
         confirm_idx: int,
         last_idx: int,
+        degree: int = 1,
+        chain: tuple[PivotPoint, ...] = (),
     ) -> Signal:
-        confirmation_time = times[confirm_idx] if confirm_idx <= last_idx else None
+        confirmed = confirm_idx <= last_idx
         return Signal(
             symbol=symbol,
             timeframe=timeframe,
@@ -330,6 +364,9 @@ class DivergenceEngine:
             direction=direction,
             reference=reference,
             pivot=point,
-            confirmation_time=confirmation_time,
+            confirmation_time=times[confirm_idx] if confirmed else None,
+            confirmation_price=float(closes[confirm_idx]) if confirmed else None,
             bars_since_confirmation=max(0, last_idx - confirm_idx),
+            degree=degree,
+            chain=chain,
         )

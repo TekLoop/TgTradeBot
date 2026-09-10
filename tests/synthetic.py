@@ -47,6 +47,9 @@ def build_df(prices: list[float], step: timedelta = timedelta(hours=1)) -> pd.Da
 #: Есть и ALERT #1, и ALERT #2: второй минимум ниже по цене, но выше по RSI.
 DIVERGENCE_SEGMENTS = [(0.4, 8), (-0.4, 8), (0.4, 8), (-2.0, 10), (1.0, 4), (-1.05, 6), (1.0, 5)]
 
+#: Тот же ряд, продлённый третьим минимумом: ещё ниже по цене, ещё выше по RSI.
+TRIPLE_SEGMENTS = DIVERGENCE_SEGMENTS + [(-0.5, 12), (1.0, 5)]
+
 #: Второй минимум ВЫШЕ первого — цена не обновила минимум, дивергенции нет.
 NO_DIVERGENCE_SEGMENTS = [(0.4, 8), (-0.4, 8), (0.4, 8), (-2.0, 10), (1.5, 5), (-1.0, 4), (1.0, 6)]
 
@@ -59,6 +62,10 @@ UPTREND_SEGMENTS = [(0.5, 60)]
 
 def divergence_df() -> pd.DataFrame:
     return build_df(make_prices(DIVERGENCE_SEGMENTS))
+
+
+def triple_df() -> pd.DataFrame:
+    return build_df(make_prices(TRIPLE_SEGMENTS))
 
 
 def no_divergence_df() -> pd.DataFrame:
