@@ -42,6 +42,18 @@ def build_df(prices: list[float], step: timedelta = timedelta(hours=1)) -> pd.Da
     return pd.DataFrame(rows)
 
 
+def build_bear_df(prices: list[float]) -> pd.DataFrame:
+    """То же, но экстремумы — максимумы: high = цена бара."""
+    df = build_df(prices)
+    df["high"] = df["close"]
+    df["low"] = df[["open", "close"]].min(axis=1)
+    return df
+
+
+def mirror(prices: list[float], axis: float = 200.0) -> list[float]:
+    return [round(axis - p, 4) for p in prices]
+
+
 # --- готовые сценарии -------------------------------------------------------
 
 #: Есть и ALERT #1, и ALERT #2: второй минимум ниже по цене, но выше по RSI.
@@ -78,3 +90,91 @@ def invalidation_df() -> pd.DataFrame:
 
 def uptrend_df() -> pd.DataFrame:
     return build_df(make_prices(UPTREND_SEGMENTS))
+
+
+# --- точные сценарии по позициям минимумов ----------------------------------
+
+
+def lows_scenario(
+    lows: list[tuple[int, float]],
+    *,
+    total: int = 95,
+    warmup: int = 25,
+    warmup_step: float = 0.5,
+    drift: float = -0.05,
+    base: float = 100.0,
+) -> pd.DataFrame:
+    """Ряд с минимумами заданной глубины в заданных позициях.
+
+    Сначала warmup баров роста — он нужен, чтобы RSI не залипал на нуле
+    (в чистом падении avg_gain = 0 и RSI ровно 0 во всех точках). Дальше
+    пологий дрейф, на который накладываются провалы из lows.
+
+    lows = [(индекс бара, насколько ниже линии дрейфа), ...]. Позиции должны
+    отстоять друг от друга минимум на fractal_n + 1 баров, иначе соседние
+    провалы съедят фракталы друг друга.
+    """
+    prices: list[float] = []
+    current = base
+    for _ in range(warmup):
+        current += warmup_step
+        prices.append(round(current, 6))
+    for _ in range(total - warmup):
+        current += drift
+        prices.append(round(current, 6))
+    for index, depth in lows:
+        if not 0 <= index < total:
+            raise ValueError(f"минимум вне ряда: {index}")
+        prices[index] = round(prices[index] - depth, 6)
+    return build_df(prices)
+
+
+# --- свечи с фитилями -------------------------------------------------------
+
+
+def wick_df(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
+    """Ряд из явных OHLC: (open, high, low, close) на каждый бар."""
+    data = []
+    for i, (open_, high, low, close) in enumerate(rows):
+        data.append(
+            {
+                "open_time": START + i * timedelta(hours=1),
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": 1.0,
+            }
+        )
+    return pd.DataFrame(data)
+
+
+def flat_with_candle(
+    total: int,
+    index: int,
+    candle: tuple[float, float, float, float],
+    base: float = 100.0,
+) -> pd.DataFrame:
+    """Ровный пилообразный ряд, в позиции index — свеча с заданным OHLC."""
+    rows: list[tuple[float, float, float, float]] = []
+    for i in range(total):
+        if i == index:
+            rows.append(candle)
+            continue
+        open_ = base
+        close = base + (0.05 if i % 2 else -0.05)
+        rows.append((open_, max(open_, close), min(open_, close), close))
+    return wick_df(rows)
+
+
+def rsi_dive_df(total: int = 60, drop: float = 2.0, tail: int = 0) -> pd.DataFrame:
+    """Затяжное падение: RSI надолго уезжает в крайнюю зону.
+
+    tail — сколько баров отскока добавить в конец (для проверки перезарядки
+    по RSI, а не по барам).
+    """
+    body = total - 10 - tail
+    segments: list[tuple[float, int]] = [(0.2, 10), (-drop, body)]
+    if tail:
+        segments.append((drop * 1.5, tail))
+    return build_df(make_prices(segments))
