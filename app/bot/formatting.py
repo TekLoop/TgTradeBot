@@ -5,14 +5,19 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from html import escape
 
-from app.analysis.signals import AlertType, Direction, Signal
+from app.analysis.signals import INSTANT_TYPES, AlertType, Direction, Signal
 from app.bot.outcomes import Outcome
+from app.core.timeframes import Timeframe
 
 ALERT_TITLES: dict[AlertType, str] = {
     AlertType.OVERSOLD_PIVOT: "ALERT #1 · Перепроданность",
     AlertType.BULLISH_DIVERGENCE: "ALERT #2 · Бычья дивергенция",
     AlertType.OVERBOUGHT_PIVOT: "ALERT #1 · Перекупленность",
     AlertType.BEARISH_DIVERGENCE: "ALERT #2 · Медвежья дивергенция",
+    AlertType.EXTREME_OVERSOLD: "EXTREME · Крайняя перепроданность",
+    AlertType.EXTREME_OVERBOUGHT: "EXTREME · Крайняя перекупленность",
+    AlertType.WICK_UPPER: "ФИТИЛЬ · Верхний",
+    AlertType.WICK_LOWER: "ФИТИЛЬ · Нижний",
 }
 
 ALERT_EMOJI: dict[AlertType, str] = {
@@ -20,6 +25,10 @@ ALERT_EMOJI: dict[AlertType, str] = {
     AlertType.BULLISH_DIVERGENCE: "🟢",
     AlertType.OVERBOUGHT_PIVOT: "🟠",
     AlertType.BEARISH_DIVERGENCE: "🔴",
+    AlertType.EXTREME_OVERSOLD: "🧊",
+    AlertType.EXTREME_OVERBOUGHT: "🔥",
+    AlertType.WICK_UPPER: "🕯",
+    AlertType.WICK_LOWER: "🕯",
 }
 
 DIRECTION_EMOJI = {Direction.BULL: "🟢", Direction.BEAR: "🔴"}
@@ -77,6 +86,9 @@ def alert_title(signal: Signal) -> str:
 
 
 def format_signal(signal: Signal) -> str:
+    if signal.type in INSTANT_TYPES:
+        return _format_instant(signal)
+
     emoji = ALERT_EMOJI.get(signal.type, "🔔")
     lines = [
         f"{emoji} <b>{escape(signal.symbol)}</b> · <b>{signal.timeframe.value}</b>",
@@ -87,6 +99,24 @@ def format_signal(signal: Signal) -> str:
         f"Свеча (закрытие): {fmt_time(signal.candle_time + signal.timeframe.duration)}",
         f"Экстремум на свече: {fmt_time(signal.candle_time)}",
     ]
+
+    if signal.displaced_anchor is not None:
+        old = signal.displaced_anchor
+        side = "ниже" if signal.direction is Direction.BULL else "выше"
+        lines += [
+            "",
+            f"<b>Опорная точка сменилась</b> — прежняя: цена "
+            f"<code>{fmt_price(old.price)}</code> · RSI <code>{fmt_rsi(old.rsi)}</code> "
+            f"({fmt_time(old.time)}). Новая точка {side} и по цене, и по RSI.",
+        ]
+
+    if signal.replaced_from is not None:
+        position = signal.replaced_from + 1  # человеку считаем с единицы
+        lines += [
+            "",
+            f"<b>Точка {position} заменена</b> — RSI обновил минимум, "
+            f"дивергенция пересчитана относительно опорной точки.",
+        ]
 
     if len(signal.chain) > 2:
         lines += ["", f"<b>Цепочка из {len(signal.chain)} точек</b>"]
@@ -138,8 +168,46 @@ def format_signal(signal: Signal) -> str:
 # --- статус -----------------------------------------------------------------
 
 
+def _format_instant(signal: Signal) -> str:
+    """Extreme-алерты и фитили: своя свеча — своё подтверждение."""
+    emoji = ALERT_EMOJI.get(signal.type, "🔔")
+    lines = [
+        f"{emoji} <b>{escape(signal.symbol)}</b> · <b>{signal.timeframe.value}</b>",
+        f"{escape(ALERT_TITLES.get(signal.type, signal.type.value))}",
+        "",
+        f"Свеча (закрытие): {fmt_time(signal.candle_time + signal.timeframe.duration)}",
+        f"Открытие свечи: {fmt_time(signal.candle_time)}",
+        f"RSI: <code>{fmt_rsi(signal.rsi)}</code>",
+    ]
+
+    if signal.wick_pct is not None:
+        lines.append(f"Фитиль: <code>{signal.wick_pct:.2f}%</code>")
+    if signal.ohlc is not None:
+        open_, high, low, close = signal.ohlc
+        lines += [
+            "",
+            f"O <code>{fmt_price(open_)}</code> · H <code>{fmt_price(high)}</code>",
+            f"L <code>{fmt_price(low)}</code> · C <code>{fmt_price(close)}</code>",
+        ]
+    else:
+        lines.append(f"Цена: <code>{fmt_price(signal.price)}</code>")
+
+    lines += [
+        "",
+        "<i>Информационный алерт: приходит сразу на закрытии свечи, "
+        "без задержки на подтверждение фрактала — в отличие от ALERT #1 и #2. "
+        "Статистика по нему не ведётся.</i>",
+    ]
+    if signal.bars_since_confirmation > 0:
+        lines.append(
+            f"<i>Свеча закрылась {signal.bars_since_confirmation} бар(ов) назад "
+            f"(догоняющая отправка).</i>"
+        )
+    return "\n".join(lines)
+
+
 def format_status_line(
-    timeframe_value: str,
+    timeframe: Timeframe,
     price: float | None,
     rsi_value: float | None,
     candle_time: datetime | None,
@@ -147,17 +215,70 @@ def format_status_line(
     error: str | None = None,
 ) -> str:
     if error:
-        return f"• <b>{timeframe_value}</b>: ошибка — {escape(error[:120])}"
-    anchor_txt = "нет"
-    if anchor:
-        anchor_txt = (
-            f"цена {fmt_price(anchor.get('price'))} / RSI {fmt_rsi(anchor.get('rsi'))}"
-        )
+        return f"• <b>{timeframe.value}</b>: ошибка — {escape(error[:120])}"
     return (
-        f"• <b>{timeframe_value}</b>: цена <code>{fmt_price(price)}</code>, "
-        f"RSI <code>{fmt_rsi(rsi_value)}</code>, опорная точка: {anchor_txt}\n"
+        f"• <b>{timeframe.value}</b>: цена <code>{fmt_price(price)}</code>, "
+        f"RSI <code>{fmt_rsi(rsi_value)}</code>\n"
+        f"  {_anchor_text(timeframe, anchor, candle_time)}\n"
         f"  <i>посл. закрытая свеча: {fmt_time(candle_time)}</i>"
     )
+
+
+def _anchor_text(
+    timeframe: Timeframe, anchor: dict | None, candle_time: datetime | None
+) -> str:
+    """«опорная … (N баров назад) · последняя … · точек: K».
+
+    При отсутствии chain_json (строка из старой БД) откатывается на одну
+    точку и показывает только опорную — без ошибки.
+    """
+    if not anchor:
+        return "опорная точка: нет"
+
+    chain = anchor.get("chain") or []
+    if chain:
+        first, last = chain[0], chain[-1]
+        head = f"опорная {fmt_price(first.price)} / RSI {fmt_rsi(first.rsi)}"
+        age = _bars_ago(timeframe, first.time, candle_time)
+        if age is not None:
+            head += f" ({age} бар(ов) назад)"
+        if len(chain) > 1:
+            head += f" · последняя {fmt_price(last.price)} / RSI {fmt_rsi(last.rsi)}"
+        return f"{head} · точек: {len(chain)}"
+
+    head = (
+        f"опорная {fmt_price(anchor.get('price'))} / RSI {fmt_rsi(anchor.get('rsi'))}"
+    )
+    age = _bars_ago(timeframe, _parse_iso(anchor.get("candle_time")), candle_time)
+    if age is not None:
+        head += f" ({age} бар(ов) назад)"
+    return f"{head} · точек: 1"
+
+
+def _parse_iso(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bars_ago(
+    timeframe: Timeframe, moment: datetime | None, now: datetime | None
+) -> int | None:
+    if moment is None or now is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    minutes = timeframe.minutes
+    if minutes <= 0:
+        return None
+    return max(0, int((now - moment).total_seconds() // (minutes * 60)))
 
 
 # --- статистика -------------------------------------------------------------
