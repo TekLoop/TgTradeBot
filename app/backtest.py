@@ -1,20 +1,27 @@
 """Офлайн-прогон детектора по истории.
 
-    python -m app.backtest --symbols BTCUSDT --timeframes 1H,4H,1D,1W --years 2
+    python -m app.backtest --symbols BTCUSDT --timeframes 4H,1D --years 8
 
 Скрипт ничего не пишет в рабочую БД бота и никуда не отправляет сообщений:
 качает свечи, гоняет тот же DivergenceEngine и печатает сводку.
 
-Перебор параметров:
+Модель сделки — лесенка тейков со стопом (app/analysis/trade_rules.py):
+вход по close подтверждающей свечи, выход только стопом или по tp3.
+Таймаута нет, новая дивергенция сделку не закрывает. Живой бот пока живёт
+по старым правилам: эта итерация проверяет новые на истории.
 
-    python -m app.backtest --tf 4H --sweep oversold=25,30,35 --sweep fractal_n=2,3
+Перебор параметров (работает и для порогов детектора, и для уровней лесенки):
+
+    python -m app.backtest --tf 4H --sweep oversold=25,30,35
+    python -m app.backtest --tf 4H --sweep tp1_pct=3,5,7 --sweep sl_buffer_pct=0,1,2
 
 Выгрузка всех сделок для ручного разбора:
 
     python -m app.backtest --tf 4H --csv data/history/trades.csv
 
-История кэшируется в data/history/*.csv, поэтому повторные прогоны и переборы
-идут без обращения к сети. Кэш дописывается свежими барами, а не качается заново.
+История кэшируется в data/cache/*.csv.gz (app/backtest_cache.py), поэтому
+повторные прогоны и переборы идут без обращения к сети. С --no-network сеть
+запрещена совсем, с --refresh период перекачивается заново.
 """
 
 from __future__ import annotations
@@ -26,24 +33,28 @@ import json
 import os
 import sqlite3
 import sys
-import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode
 
 import pandas as pd
 
-from app.analysis.replay import REASON_LABELS, REASON_REVERSE, Trade, aggregate, evaluate
+from app.analysis.replay import (
+    SubBarIndex,
+    Trade,
+    aggregate,
+    build_subbars,
+    evaluate,
+    group_by_sl_distance,
+    supports_intrabar,
+)
 from app.analysis.signals import DivergenceEngine
+from app.analysis.trade_rules import LADDER_KEYS, REASON_ORDER, TradeRules
+from app.backtest_cache import CacheError, CacheSettings, load_klines
 from app.core.timeframes import Timeframe
 from app.data.resampling import resample_ohlcv
 
 DEFAULT_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision")
-DEFAULT_TIMEFRAMES = "1H,4H,1D,1W"
-REQUEST_LIMIT = 1000
-REQUEST_PAUSE = 0.25
+DEFAULT_TIMEFRAMES = "4H,1D"
 
 #: Нативные интервалы Binance. 3H собирается из 1H, 1W — из 1D,
 #: ровно как в app/data/binance.py.
@@ -53,8 +64,6 @@ NATIVE_INTERVALS: dict[Timeframe, str] = {
     Timeframe.H4: "4h",
     Timeframe.D1: "1d",
 }
-
-OHLCV = ["open_time", "open", "high", "low", "close", "volume"]
 
 
 # --- загрузка истории -------------------------------------------------------
@@ -69,165 +78,57 @@ def base_timeframe(tf: Timeframe) -> Timeframe:
     return max(candidates, key=lambda base: base.minutes)
 
 
-def _get_json(url: str, retries: int = 4):
-    delay = 1.0
-    for attempt in range(retries + 1):
-        try:
-            request = urllib.request.Request(
-                url, headers={"User-Agent": "rsi-divergence-backtest/1.0"}
-            )
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if exc.code == 451:
-                raise SystemExit(
-                    "Binance вернул 451 — этот IP заблокирован. "
-                    "Проверьте базовый URL и регион сервера."
-                ) from exc
-            if exc.code not in {418, 429, 500, 502, 503, 504} or attempt == retries:
-                raise
-        except (urllib.error.URLError, TimeoutError):
-            if attempt == retries:
-                raise
-        time.sleep(delay)
-        delay = min(delay * 2, 20.0)
-    raise RuntimeError("недостижимо")
-
-
-def fetch_klines(
-    symbol: str, interval: str, start_ms: int, base_url: str, step_ms: int
-) -> pd.DataFrame:
-    """Постраничная выкачка свечей от start_ms до текущего момента."""
-    now_ms = int(time.time() * 1000)
-    cursor = start_ms
-    rows: list[dict] = []
-    requests = 0
-
-    while cursor < now_ms:
-        query = urlencode(
-            {
-                "symbol": symbol.upper(),
-                "interval": interval,
-                "startTime": cursor,
-                "limit": REQUEST_LIMIT,
-            }
-        )
-        payload = _get_json(f"{base_url.rstrip('/')}/api/v3/klines?{query}")
-        requests += 1
-        if not payload:
-            break
-
-        for item in payload:
-            if int(item[6]) >= now_ms:
-                continue  # свеча ещё не закрылась
-            rows.append(
-                {
-                    "open_time": pd.to_datetime(int(item[0]), unit="ms", utc=True),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5]),
-                }
-            )
-
-        cursor = int(payload[-1][0]) + step_ms
-        print(
-            f"  … {symbol} {interval}: {len(rows)} баров",
-            file=sys.stderr, end="\r", flush=True,
-        )
-        if len(payload) < REQUEST_LIMIT:
-            break
-        time.sleep(REQUEST_PAUSE)
-
-    if requests:
-        print(
-            f"  {symbol} {interval}: загружено {len(rows)} баров "
-            f"за {requests} запрос(ов)   ",
-            file=sys.stderr,
-        )
-    return pd.DataFrame(rows, columns=OHLCV)
-
-
-def _cache_path(cache_dir: Path, symbol: str, interval: str) -> Path:
-    return cache_dir / f"{symbol.upper()}_{interval}.csv"
-
-
-def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    """Склейка без пустых кусков: пустой кадр сбивает тип колонки времени."""
-    filled = [frame for frame in frames if not frame.empty]
-    if not filled:
-        return pd.DataFrame(columns=OHLCV)
-    if len(filled) == 1:
-        return filled[0].reset_index(drop=True)
-    return pd.concat(filled, ignore_index=True)
-
-
-def _read_cache(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame(columns=OHLCV)
-    df = pd.read_csv(path)
-    # В кэше время лежит целыми миллисекундами: никакой возни с разбором
-    # строковых таймзон при чтении.
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    return df
-
-
 def load_history(
     symbol: str,
     tf: Timeframe,
     years: float,
     *,
-    cache_dir: Path,
-    base_url: str,
-    use_cache: bool = True,
+    settings: CacheSettings,
+    now: datetime | None = None,
 ) -> pd.DataFrame:
     """Отдаёт закрытые свечи нужного ТФ за последние `years` лет."""
     base = base_timeframe(tf)
     interval = NATIVE_INTERVALS[base]
     step_ms = base.minutes * 60_000
-    start = datetime.now(timezone.utc) - timedelta(days=365.25 * years)
+    moment = now or datetime.now(timezone.utc)
+    start = moment - timedelta(days=365.25 * years)
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    path = _cache_path(cache_dir, symbol, interval)
-    cached = _read_cache(path) if use_cache else pd.DataFrame(columns=OHLCV)
-
-    start_ms = int(start.timestamp() * 1000)
-    if not cached.empty:
-        # Докачиваем только то, чего нет: хвост и, если нужно, начало.
-        # Первый бар кэша почти никогда не совпадает со start до миллисекунды —
-        # запас в одну свечу, иначе голова качалась бы при каждом прогоне.
-        if cached["open_time"].min() - pd.Timestamp(start) > base.duration:
-            fresh_head = fetch_klines(symbol, interval, start_ms, base_url, step_ms)
-            cached = _concat([fresh_head, cached])
-        tail_from = int(cached["open_time"].max().timestamp() * 1000) + step_ms
-        fresh_tail = fetch_klines(symbol, interval, tail_from, base_url, step_ms)
-        cached = _concat([cached, fresh_tail])
-    else:
-        cached = fetch_klines(symbol, interval, start_ms, base_url, step_ms)
-
-    if cached.empty:
-        return cached
-
-    cached = (
-        cached.drop_duplicates(subset="open_time", keep="last")
-        .sort_values("open_time")
-        .reset_index(drop=True)
+    window = load_klines(
+        symbol, interval, start, step_ms, settings=settings, now=moment
     )
-    if use_cache:
-        out = cached.copy()
-        out["open_time"] = (
-            out["open_time"] - pd.Timestamp("1970-01-01", tz="UTC")
-        ) // pd.Timedelta("1ms")
-        out.to_csv(path, index=False)
-
-    window = cached.loc[cached["open_time"] >= pd.Timestamp(start)].reset_index(drop=True)
-    if base is tf:
+    if window.empty or base is tf:
         return window
     return resample_ohlcv(window, tf, source=base)
 
 
 # --- параметры --------------------------------------------------------------
+
+
+def split_ladder(assignments: dict) -> tuple[dict, dict]:
+    """Делит разобранные --param на ключи лесенки и всё остальное.
+
+    Ключи лесенки в ParamsConfig попасть не должны: эта модель общая с живым
+    ботом, и новые поля тут же появились бы в его валидации и в /params.
+    """
+    ladder: dict = {}
+    params: dict = {}
+    for tf, values in assignments.items():
+        for key, value in values.items():
+            target = ladder if key in LADDER_KEYS else params
+            target.setdefault(tf, {})[key] = value
+    return ladder, params
+
+
+def rules_for(tf: Timeframe, ladder: dict, extra: dict | None = None) -> TradeRules:
+    """Таблица уровней по таймфрейму + глобальные --param + --param TF:… ."""
+    overrides: dict = {}
+    overrides.update(ladder.get(None, {}))
+    overrides.update(ladder.get(tf, {}))
+    overrides.update(extra or {})
+    try:
+        return TradeRules.for_timeframe(tf, overrides)
+    except ValueError as exc:
+        raise SystemExit(f"Параметры лесенки для {tf.value}: {exc}") from exc
 
 
 def load_params(config_path: str, db_path: str | None, overrides: dict):
@@ -343,16 +244,21 @@ def _coerce(raw: str):
         return raw
 
 
-# --- прогон и отчёт ---------------------------------------------------------
+# --- прогон -----------------------------------------------------------------
 
 
 def run_one(
-    symbol: str, tf: Timeframe, df: pd.DataFrame, params
+    symbol: str,
+    tf: Timeframe,
+    df: pd.DataFrame,
+    params,
+    rules: TradeRules,
+    subbars: SubBarIndex | None = None,
 ) -> tuple[list[Trade], list]:
     """(сделки, сигналы). Сигналы нужны для аудита расхождений между прогонами."""
     engine = DivergenceEngine(params.to_signal_params())
     result = engine.analyze(df, symbol, tf)
-    trades = evaluate(df, result.signals, timeout_bars=params.outcome_timeout_bars)
+    trades = evaluate(df, result.signals, rules=rules, subbars=subbars)
     return trades, result.signals
 
 
@@ -388,82 +294,157 @@ def dump_signals(path: str, signals: list) -> None:
     print(f"Выгружено сигналов: {len(rows)} → {target}")
 
 
+def dump_csv(path: str, trades: list[Trade]) -> None:
+    if not trades:
+        print("Нечего выгружать: сделок нет", file=sys.stderr)
+        return
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rows = [trade.as_row() for trade in trades]
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\nВыгружено сделок: {len(rows)} → {target}")
+
+
+# --- отчёт ------------------------------------------------------------------
+
+
 def _pct(value: float | None, width: int = 7) -> str:
     return "—".rjust(width) if value is None else f"{value:+.2f}%".rjust(width)
 
 
-def _num(value: float | None, width: int = 5) -> str:
-    return "—".rjust(width) if value is None else f"{value:.0f}".rjust(width)
+def _num(value: float | None, width: int = 5, digits: int = 0) -> str:
+    return "—".rjust(width) if value is None else f"{value:.{digits}f}".rjust(width)
+
+
+def _rate(value: float | None, width: int = 5) -> str:
+    return "—".rjust(width) if value is None else f"{value:.0f}%".rjust(width)
+
+
+#: Короткие подписи для таблиц: длинные не влезают в колонку.
+SHORT_REASONS = {"sl": "стоп", "be": "безубыток", "tp3": "тейк 3"}
+
+GROUP_HEADER = (
+    f"    {'':<18}{'n':>5} {'среднее':>9} {'медиана':>9} {'R':>7} "
+    f"{'плюс':>6} {'sl':>6} {'be':>6} {'tp3':>6}"
+)
+
+
+def _group_line(label: str, stats: dict) -> str:
+    if not stats["count"]:
+        return f"    {label:<18}{0:>5}"
+    shares = stats["reason_shares"]
+    return (
+        f"    {label:<18}{stats['count']:>5} {_pct(stats['result'], 9)} "
+        f"{_pct(stats['median'], 9)} {_num(stats['r'], 7, 2)} "
+        f"{_rate(stats['win_rate'], 6)} {_rate(shares['sl'], 6)} "
+        f"{_rate(shares['be'], 6)} {_rate(shares['tp3'], 6)}"
+    )
+
+
+def print_groups(title: str, groups: dict[str, list[Trade]]) -> None:
+    """Разрез: имя группы → сделки. Пустые группы печатаются как n=0,
+    чтобы в таблице было видно, что корзина пуста, а не потеряна."""
+    if not groups:
+        return
+    print(f"\n  {title}")
+    print(GROUP_HEADER)
+    for label, part in groups.items():
+        print(_group_line(label, aggregate(part)))
+
+
+def print_summary(trades: list[Trade], title: str) -> None:
+    stats = aggregate(trades)
+    print(f"\n=== {title} ===")
+    if not stats["count"]:
+        print(f"  закрытых сделок нет (открытых {stats['open']})")
+        return
+    print(
+        f"  закрытых сделок: {stats['count']} · "
+        f"среднее {_pct(stats['result'])} · медиана {_pct(stats['median'])} · "
+        f"винрейт {stats['win_rate']:.0f}% · среднее в R {stats['r']:+.2f}\n"
+        f"  ход в пользу {_pct(stats['mfe'])} · ход против {_pct(stats['mae'])} · "
+        f"дистанция стопа {_num(stats['sl_dist'], 5, 2)}% · "
+        f"держится {_num(stats['bars'])} бар(ов)\n"
+        f"  не закрыто к концу истории: {stats['open']} "
+        f"(в средние и винрейт не входят)"
+    )
+
+
+def print_breakdowns(trades: list[Trade]) -> None:
+    """Разрезы отчёта. Главный из них — по дистанции стопа: он показывает,
+    зависит ли результат от того, насколько далеко оказался структурный стоп."""
+    if not trades:
+        return
+
+    print_groups("по дистанции стопа:", group_by_sl_distance(trades))
+
+    by_reason: dict[str, list[Trade]] = {
+        SHORT_REASONS[reason]: [t for t in trades if t.exit_reason == reason]
+        for reason in REASON_ORDER
+    }
+    print_groups("по причине выхода:", by_reason)
+
+    by_direction: dict[str, list[Trade]] = {}
+    for trade in trades:
+        by_direction.setdefault(trade.direction.value, []).append(trade)
+    if len(by_direction) > 1:
+        print_groups("по направлению:", dict(sorted(by_direction.items())))
+
+    by_tf: dict[str, list[Trade]] = {}
+    for trade in trades:
+        by_tf.setdefault(trade.timeframe.value, []).append(trade)
+    if len(by_tf) > 1:
+        print_groups("по таймфрейму:", dict(sorted(by_tf.items())))
+
+    by_degree: dict[str, list[Trade]] = {}
+    for trade in trades:
+        by_degree.setdefault(f"×{trade.degree}", []).append(trade)
+    if len(by_degree) > 1:
+        print_groups("по числу точек:", dict(sorted(by_degree.items())))
 
 
 def print_report(symbol: str, tf: Timeframe, df: pd.DataFrame, trades: list[Trade]) -> None:
+    """Компактная сводка по одной паре: подробные разрезы — в общем отчёте."""
     span = ""
     if not df.empty:
         span = (
             f"{df['open_time'].iloc[0]:%Y-%m-%d} → {df['open_time'].iloc[-1]:%Y-%m-%d}"
         )
+    stats = aggregate(trades)
     print(f"\n=== {symbol} · {tf.value} · {len(df)} баров · {span} ===")
-
-    total = aggregate(trades)
-    if not total["count"]:
-        print(f"  закрытых сделок нет (открытых {total['open']})")
+    if not stats["count"]:
+        print(f"  закрытых сделок нет (открытых {stats['open']})")
         return
-
+    shares = stats["reason_shares"]
     print(
-        f"  сделок закрыто: {total['count']} (открытых {total['open']})\n"
-        f"  итог:         среднее {_pct(total['result'])} · "
-        f"медиана {_pct(total['median'])} · "
-        f"плюсовых {total['wins']} ({total['win_rate']:.0f}%)\n"
-        f"  ход в пользу: {_pct(total['favorable'])} "
-        f"(лучший {_pct(total['best'])}) · за {_num(total['bars_to_favorable'])} бар(ов)\n"
-        f"  ход против:   {_pct(total['adverse'])} (худший {_pct(total['worst'])})\n"
-        f"  держится:     {_num(total['bars'])} бар(ов)"
+        f"  закрыто {stats['count']} (открыто {stats['open']}) · "
+        f"среднее {_pct(stats['result'])} · медиана {_pct(stats['median'])} · "
+        f"винрейт {stats['win_rate']:.0f}% · R {stats['r']:+.2f}\n"
+        f"  исходы: sl {shares['sl']:.0f}% · be {shares['be']:.0f}% · "
+        f"tp3 {shares['tp3']:.0f}%"
     )
 
-    by_degree: dict[int, list[Trade]] = {}
-    for trade in trades:
-        by_degree.setdefault(trade.degree, []).append(trade)
-    if len(by_degree) > 1:
-        print("  по числу точек:")
-        for degree in sorted(by_degree):
-            part = aggregate(by_degree[degree])
-            if not part["count"]:
-                continue
-            print(
-                f"    ×{degree}: n={part['count']:<4} итог {_pct(part['result'])} · "
-                f"в пользу {_pct(part['favorable'])} · против {_pct(part['adverse'])} · "
-                f"плюсовых {part['win_rate']:.0f}%"
-            )
 
-    by_reason: dict[str, list[Trade]] = {}
-    for trade in trades:
-        by_reason.setdefault(trade.exit_reason, []).append(trade)
-    if len(by_reason) > 1:
-        print("  по причине выхода:")
-        for reason, part_trades in by_reason.items():
-            part = aggregate(part_trades)
-            if not part["count"]:
-                continue
-            print(
-                f"    {REASON_LABELS.get(reason, reason):<34} n={part['count']:<4} "
-                f"итог {_pct(part['result'])}"
-            )
+def print_full_report(trades: list[Trade]) -> None:
+    """Секции 1–6 отчёта: сводка, разрезы, затем то же самое по независимым
+    входам (first_in_series)."""
+    print_summary(trades, "ИТОГО")
+    print_breakdowns(trades)
 
-    clean = [t for t in trades if t.exit_reason == REASON_REVERSE]
-    clean_stats = aggregate(clean)
-    if clean_stats["count"] and clean_stats["count"] != total["count"]:
-        print(
-            f"  только выход по обратной дивергенции: n={clean_stats['count']} · "
-            f"итог {_pct(clean_stats['result'])} · "
-            f"плюсовых {clean_stats['win_rate']:.0f}%"
-        )
+    first = [t for t in trades if t.first_in_series]
+    if first and len(first) != len(trades):
+        print_summary(first, "ТОЛЬКО НЕЗАВИСИМЫЕ ВХОДЫ (first_in_series)")
+        print_breakdowns(first)
 
 
 def print_sweep(rows: list[tuple[dict, dict]], keys: list[str]) -> None:
     print("\n=== перебор параметров ===")
     header = " · ".join(f"{key}" for key in keys)
-    print(f"{header:<38} {'n':>5} {'итог':>8} {'медиана':>9} {'плюс':>6} "
-          f"{'в пользу':>9} {'против':>9}")
+    print(f"{header:<30} {'n':>5} {'среднее':>9} {'медиана':>9} {'R':>7} "
+          f"{'плюс':>6} {'sl':>6} {'be':>6} {'tp3':>6}")
     ranked = sorted(
         rows,
         key=lambda row: (row[1]["result"] if row[1]["result"] is not None else -1e9),
@@ -472,12 +453,14 @@ def print_sweep(rows: list[tuple[dict, dict]], keys: list[str]) -> None:
     for combo, stats in ranked:
         label = " · ".join(f"{combo[key]}" for key in keys)
         if not stats["count"]:
-            print(f"{label:<38} {0:>5}")
+            print(f"{label:<30} {0:>5}")
             continue
+        shares = stats["reason_shares"]
         print(
-            f"{label:<38} {stats['count']:>5} {_pct(stats['result'], 8)} "
-            f"{_pct(stats['median'], 9)} {stats['win_rate']:>5.0f}% "
-            f"{_pct(stats['favorable'], 9)} {_pct(stats['adverse'], 9)}"
+            f"{label:<30} {stats['count']:>5} {_pct(stats['result'], 9)} "
+            f"{_pct(stats['median'], 9)} {_num(stats['r'], 7, 2)} "
+            f"{_rate(stats['win_rate'], 6)} {_rate(shares['sl'], 6)} "
+            f"{_rate(shares['be'], 6)} {_rate(shares['tp3'], 6)}"
         )
     print(
         "\nОсторожно с верхней строкой: при переборе десятков комбинаций лучшая "
@@ -547,20 +530,6 @@ def print_signal_summary(signals: list) -> None:
         )
 
 
-def dump_csv(path: str, trades: list[Trade]) -> None:
-    if not trades:
-        print("Нечего выгружать: сделок нет", file=sys.stderr)
-        return
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    rows = [trade.as_row() for trade in trades]
-    with target.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"\nВыгружено сделок: {len(rows)} → {target}")
-
-
 # --- точка входа ------------------------------------------------------------
 
 
@@ -575,8 +544,14 @@ def main() -> None:
     parser.add_argument("--db", default="data/state.db", help="откуда взять правки /params")
     parser.add_argument("--no-db-params", action="store_true")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--cache-dir", default="data/history")
-    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--cache-dir", default="data/cache")
+    parser.add_argument(
+        "--no-network", action="store_true",
+        help="работать только на кэше; не хватает данных — падать",
+    )
+    parser.add_argument(
+        "--refresh", action="store_true", help="перекачать историю заново",
+    )
     parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--sweep", action="append", default=[], metavar="KEY=V1,V2")
     parser.add_argument("--csv", default="")
@@ -586,9 +561,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    overrides = parse_assignments(args.param)
+    assignments = parse_assignments(args.param)
+    ladder, detector = split_ladder(assignments)
     base_params, layers = load_params(
-        args.config, None if args.no_db_params else args.db, overrides
+        args.config, None if args.no_db_params else args.db, detector
     )
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -596,6 +572,11 @@ def main() -> None:
         symbols = _symbols_from_config(args.config)
     timeframes = [Timeframe.parse(chunk) for chunk in args.timeframes.split(",") if chunk.strip()]
 
+    sweep = parse_sweep(args.sweep)
+    sweep_ladder = {key: values for key, values in sweep.items() if key in LADDER_KEYS}
+    sweep_detector = {key: values for key, values in sweep.items() if key not in LADDER_KEYS}
+
+    rules_by_tf = {tf: rules_for(tf, ladder) for tf in timeframes}
     for tf in timeframes:
         params = resolve_params(base_params, layers, tf)
         print(
@@ -606,36 +587,74 @@ def main() -> None:
             f"max_between={params.max_bars_between_points}, "
             f"min_between={params.min_bars_between_points}, "
             f"chain_max_points={params.chain_max_points}, "
-            f"bearish={'вкл' if params.bearish_enabled else 'выкл'}, "
-            f"timeout={params.outcome_timeout_bars}",
+            f"bearish={'вкл' if params.bearish_enabled else 'выкл'}",
             file=sys.stderr,
         )
+        # Через месяц по CSV уже не восстановить, по каким цифрам он считался.
+        print(f"Выходы {tf.value}: {rules_by_tf[tf].describe()}", file=sys.stderr)
+
+    settings = CacheSettings(
+        cache_dir=Path(args.cache_dir),
+        base_url=args.base_url,
+        offline=args.no_network,
+        refresh=args.refresh,
+    )
+    needs_hourly = any(
+        rules.intrabar_resolution == "1h" and supports_intrabar(tf)
+        for tf, rules in rules_by_tf.items()
+    )
+    for tf, rules in rules_by_tf.items():
+        if rules.intrabar_resolution == "1h" and not supports_intrabar(tf):
+            print(
+                f"{tf.value}: порядок внутри бара часами не разрешается, "
+                f"работает правило «стоп первым»",
+                file=sys.stderr,
+            )
 
     history: dict[tuple[str, Timeframe], pd.DataFrame] = {}
-    for symbol in symbols:
-        for tf in timeframes:
-            df = load_history(
-                symbol, tf, args.years,
-                cache_dir=Path(args.cache_dir),
-                base_url=args.base_url,
-                use_cache=not args.no_cache,
-            )
-            history[(symbol, tf)] = df
+    hourly: dict[str, pd.DataFrame] = {}
+    try:
+        for symbol in symbols:
+            for tf in timeframes:
+                history[(symbol, tf)] = load_history(
+                    symbol, tf, args.years, settings=settings
+                )
+            if needs_hourly:
+                # Часовые свечи качаются для тех же активов и того же периода,
+                # что и основной таймфрейм, и только когда они реально нужны.
+                hourly[symbol] = load_history(
+                    symbol, Timeframe.H1, args.years, settings=settings
+                )
+    except CacheError as exc:
+        raise SystemExit(str(exc)) from exc
 
-    sweep = parse_sweep(args.sweep)
+    subbars: dict[tuple[str, Timeframe], SubBarIndex | None] = {}
+    for (symbol, tf) in history:
+        rules = rules_by_tf[tf]
+        subbars[(symbol, tf)] = (
+            build_subbars(hourly.get(symbol), tf)
+            if rules.intrabar_resolution == "1h" else None
+        )  # build_subbars сам отсеет таймфреймы, которые часами не разложить
+
     if sweep:
         keys = list(sweep)
         rows: list[tuple[dict, dict]] = []
         for combo_values in itertools.product(*(sweep[key] for key in keys)):
             combo = dict(zip(keys, combo_values))
+            ladder_combo = {k: v for k, v in combo.items() if k in sweep_ladder}
+            detector_combo = {k: v for k, v in combo.items() if k in sweep_detector}
             trades: list[Trade] = []
             for (symbol, tf), df in history.items():
                 if len(df) < 60:
                     continue
                 candidate = resolve_params(base_params, layers, tf).model_copy(
-                    update=combo
+                    update=detector_combo
                 )
-                trades += run_one(symbol, tf, df, candidate)[0]
+                trades += run_one(
+                    symbol, tf, df, candidate,
+                    rules_for(tf, ladder, ladder_combo),
+                    subbars[(symbol, tf)],
+                )[0]
             rows.append((combo, aggregate(trades)))
         print_sweep(rows, keys)
         return
@@ -647,22 +666,15 @@ def main() -> None:
             print(f"\n=== {symbol} · {tf.value} === мало данных ({len(df)} баров)")
             continue
         params = resolve_params(base_params, layers, tf)
-        trades, signals = run_one(symbol, tf, df, params)
+        trades, signals = run_one(
+            symbol, tf, df, params, rules_by_tf[tf], subbars[(symbol, tf)]
+        )
         all_trades += trades
         all_signals += signals
         print_report(symbol, tf, df, trades)
 
     print_signal_summary(all_signals)
-
-    if len(history) > 1:
-        total = aggregate(all_trades)
-        print(
-            f"\n=== ИТОГО по всем парам ===\n"
-            f"  закрытых сделок: {total['count']} · "
-            f"итог {_pct(total['result'])} · медиана {_pct(total['median'])} · "
-            f"плюсовых {total['wins']}"
-            if total["count"] else "\n=== ИТОГО === закрытых сделок нет"
-        )
+    print_full_report(all_trades)
 
     if args.csv:
         dump_csv(args.csv, all_trades)
