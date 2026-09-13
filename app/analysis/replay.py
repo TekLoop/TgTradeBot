@@ -30,6 +30,7 @@ from app.analysis.trade_rules import (
     REASON_LABELS,
     REASON_OPEN,
     REASON_ORDER,
+    REASON_PIVOT,
     REASON_SL,
     REASON_TP3,
     Bar,
@@ -45,6 +46,7 @@ __all__ = [
     "REASON_LABELS",
     "REASON_OPEN",
     "REASON_ORDER",
+    "REASON_PIVOT",
     "REASON_SL",
     "REASON_TP3",
     "INTRABAR_TIMEFRAMES",
@@ -166,6 +168,13 @@ class Trade:
         return self.result.result_pct
 
     @property
+    def realized_pct(self) -> float:
+        """Что уже зафиксировано. У открытой сделки result_pct пуст, а эта
+        величина показывает взятые тейки — иначе открытые сделки пропадают
+        из картины целиком."""
+        return self.result.realized_pct
+
+    @property
     def r_multiple(self) -> float | None:
         return self.result.r_multiple
 
@@ -211,6 +220,7 @@ class Trade:
             "exit_time": _iso(result.exit_time),
             "exit_reason": result.exit_reason,
             "result_pct": _round(result.result_pct, 3),
+            "realized_pct": round(result.realized_pct, 3),
             "r_multiple": _round(result.r_multiple, 3),
             "mae_pct": round(result.mae_pct, 3),
             "mfe_pct": round(result.mfe_pct, 3),
@@ -361,6 +371,11 @@ def aggregate(trades: list[Trade]) -> dict:
     return {
         "count": len(closed),
         "open": len(trades) - len(closed),
+        "total": len(trades),
+        # Среднее зафиксированного по ВСЕМ сделкам, включая открытые. При
+        # далёком tp3 почти каждый победитель остаётся открытым, и среднее
+        # по закрытым состоит из одних убытков.
+        "realized_all": _mean([t.realized_pct for t in trades]),
         "result": _mean(results),
         "median": _median(results),
         "r": _mean(r_values),
