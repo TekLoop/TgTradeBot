@@ -12,19 +12,30 @@
     стоп   = либо от свечи экстремума (sl_set=low, по умолчанию),
              либо процент от входа (sl_set=enter);
     тейки  = три уровня в процентах от входа, объёмы 30% / 30% / остаток;
-    после tp1 стоп переезжает на цену входа и дальше не двигается.
+    переезд стопа после tp1 задаётся sl_after_tp1:
+        "entry" — сразу в безубыток (поведение по умолчанию);
+        "pivot" — РОВНО на цену пивота, без буфера; в безубыток стоп
+                  переезжает только после tp2.
 
-Автомат состояний:
+Автомат состояний (sl_after_tp1="pivot"):
 
-    S0  стоп исходный, активны stop и tp1
+    S0  стоп исходный (пивот − buffer), активны stop и tp1
         stop → закрыть 100% по стопу,     reason = "sl"
-        tp1  → зафиксировать tp1_size,    стоп → entry, перейти в S1
-    S1  стоп = entry, активны stop и tp2
-        stop → закрыть остаток по entry,  reason = "be"
-        tp2  → зафиксировать tp2_size,    перейти в S2
+        tp1  → зафиксировать tp1_size,    стоп → pivot, перейти в S1
+    S1  стоп = pivot, активны stop и tp2
+        stop → закрыть остаток по pivot,  reason = "pivot"
+        tp2  → зафиксировать tp2_size,    стоп → entry, перейти в S2
     S2  стоп = entry, активны stop и tp3
         stop → закрыть остаток по entry,  reason = "be"
         tp3  → зафиксировать остаток,     reason = "tp3"
+
+При sl_after_tp1="entry" стоп из S0 сразу уезжает на entry, состояние S1
+работает как S2, и причины "pivot" в выводе не бывает.
+
+ВАЖНО про "pivot": этот стоп стоит НИЖЕ входа, значит выход по нему —
+это убыток, а не безубыток. Сделка, взявшая tp1 и выбитая по пивоту,
+вполне может закрыться в минус: 30% позиции в плюс не перекрывают 70%
+по цене ниже входа. Ради этого причина и вынесена отдельной меткой.
 
 Таймаута нет, новая дивергенция сделку не закрывает: выйти можно только
 стопом или по tp3. Пока данные не кончились и ни то, ни другое не случилось,
@@ -55,19 +66,21 @@ from app.core.timeframes import Timeframe
 # --- причины выхода ---------------------------------------------------------
 
 REASON_SL = "sl"        # стоп на исходном уровне
-REASON_BE = "be"        # стоп в безубытке, уже после tp1
+REASON_PIVOT = "pivot"  # стоп переехал на цену пивота — это ещё минус
+REASON_BE = "be"        # стоп в безубытке
 REASON_TP3 = "tp3"      # дошли до последнего тейка
 REASON_OPEN = "open"    # данные кончились, сделка не закрыта
 
 REASON_LABELS = {
     REASON_SL: "стоп",
+    REASON_PIVOT: "стоп на пивоте",
     REASON_BE: "безубыток",
     REASON_TP3: "полный проход (tp3)",
     REASON_OPEN: "не закрыта (конец данных)",
 }
 
 #: Порядок для отчётов: сначала худший исход, потом лучший.
-REASON_ORDER = (REASON_SL, REASON_BE, REASON_TP3)
+REASON_ORDER = (REASON_SL, REASON_PIVOT, REASON_BE, REASON_TP3)
 
 # --- уровни тейков по таймфреймам -------------------------------------------
 
@@ -116,10 +129,19 @@ class TradeRules:
     tp1_size: float = 30.0
     tp2_size: float = 30.0
 
+    #: куда уезжает стоп после tp1: entry — в безубыток, pivot — на цену
+    #: пивота без буфера (в безубыток тогда только после tp2)
+    sl_after_tp1: str = "entry"
+
     #: 1h — разрешать порядок внутри бара часовыми свечами, off — не разрешать
     intrabar_resolution: str = "1h"
 
     def __post_init__(self) -> None:
+        if self.sl_after_tp1 not in {"entry", "pivot"}:
+            raise ValueError(
+                f"sl_after_tp1: ожидалось entry или pivot, "
+                f"получено {self.sl_after_tp1!r}"
+            )
         if self.sl_set not in {"low", "enter"}:
             raise ValueError(f"sl_set: ожидалось low или enter, получено {self.sl_set!r}")
         if self.intrabar_resolution not in {"1h", "off"}:
@@ -186,9 +208,15 @@ class TradeRules:
             if self.sl_set == "low"
             else f"стоп {self.sl_percent:g}% от входа"
         )
+        after = (
+            "после tp1 стоп на пивот, после tp2 в безубыток"
+            if self.sl_after_tp1 == "pivot"
+            else "после tp1 стоп в безубыток"
+        )
         return (
             f"{stop} · тейки {self.tp1_pct:g}/{self.tp2_pct:g}/{self.tp3_pct:g}% "
             f"объёмами {self.tp1_size:g}/{self.tp2_size:g}/{self.tp3_size:g}% · "
+            f"{after} · "
             f"внутрибарное разрешение {self.intrabar_resolution}"
         )
 
@@ -357,6 +385,17 @@ def simulate_trade(
             f"стоп {stop:g} не выше цены входа {entry_price:g} — для шорта это ошибка"
         )
 
+    #: Куда уедет стоп после tp1. "pivot" требует цену пивота и требует,
+    #: чтобы она была по нужную сторону от входа; иначе молча работает
+    #: безубыток — это заведомо более консервативный вариант.
+    stop_after_tp1 = entry_price
+    tag_after_tp1 = REASON_BE
+    if rules.sl_after_tp1 == "pivot" and entry.pivot_price is not None:
+        candidate = float(entry.pivot_price)
+        if (bull and candidate < entry_price) or (not bull and candidate > entry_price):
+            stop_after_tp1 = candidate
+            tag_after_tp1 = REASON_PIVOT
+
     sign = 1.0 if bull else -1.0
     tp_prices = tuple(
         entry_price * (1.0 + sign * level / 100.0) for level in rules.tp_levels
@@ -365,6 +404,7 @@ def simulate_trade(
 
     state = 0                  # 0 — исходный стоп, 1 — после tp1, 2 — после tp2
     current_stop = stop
+    stop_tag = REASON_SL       # метка, с которой закроется текущий стоп
     remaining = 1.0
     fills: list[Fill] = []
     exit_reason = REASON_OPEN
@@ -382,11 +422,11 @@ def simulate_trade(
         """Отрабатывает все события внутри одного (под)бара.
 
         Возвращает число сработавших событий. Внутри бара может пройти целая
-        цепочка: tp1 → стоп переехал в безубыток → безубыток выбит. При
+        цепочка: tp1 → стоп переехал → новый стоп выбит. При
         одновременном касании стопа и тейка первым считается стоп —
         консервативно.
         """
-        nonlocal state, current_stop, remaining, exit_reason, exit_time
+        nonlocal state, current_stop, stop_tag, remaining, exit_reason, exit_time
         events = 0
         while exit_reason == REASON_OPEN:
             hit_stop = touches_stop(bar)
@@ -395,7 +435,7 @@ def simulate_trade(
                 break
             events += 1
             if hit_stop:
-                tag = REASON_SL if state == 0 else REASON_BE
+                tag = stop_tag
                 fills.append(Fill(bar.time, current_stop, remaining, tag))
                 remaining = 0.0
                 exit_reason = tag
@@ -408,7 +448,12 @@ def simulate_trade(
                 exit_reason = REASON_TP3
                 exit_time = bar.time
                 break
-            current_stop = entry_price     # после первого тейка — безубыток
+            if state == 0:
+                current_stop = stop_after_tp1
+                stop_tag = tag_after_tp1
+            else:
+                current_stop = entry_price     # после второго тейка — безубыток
+                stop_tag = REASON_BE
             state += 1
         return events
 
