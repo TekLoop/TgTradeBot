@@ -324,11 +324,18 @@ def _rate(value: float | None, width: int = 5) -> str:
 
 
 #: Короткие подписи для таблиц: длинные не влезают в колонку.
-SHORT_REASONS = {"sl": "стоп", "be": "безубыток", "tp3": "тейк 3"}
+SHORT_REASONS = {
+    "sl": "стоп",
+    "pivot": "пивот",
+    "be": "безуб",
+    "tp3": "тейк 3",
+}
 
+#: Колонки причин строятся из REASON_ORDER, а не перечисляются руками:
+#: добавили причину в trade_rules — она сама появилась в таблице.
 GROUP_HEADER = (
-    f"    {'':<18}{'n':>5} {'среднее':>9} {'медиана':>9} {'R':>7} "
-    f"{'плюс':>6} {'sl':>6} {'be':>6} {'tp3':>6}"
+    f"    {'':<18}{'n':>5} {'среднее':>9} {'медиана':>9} {'R':>7} {'плюс':>6}"
+    + "".join(f"{SHORT_REASONS[reason]:>7}" for reason in REASON_ORDER)
 )
 
 
@@ -336,11 +343,11 @@ def _group_line(label: str, stats: dict) -> str:
     if not stats["count"]:
         return f"    {label:<18}{0:>5}"
     shares = stats["reason_shares"]
+    tail = "".join(_rate(shares[reason], 7) for reason in REASON_ORDER)
     return (
         f"    {label:<18}{stats['count']:>5} {_pct(stats['result'], 9)} "
         f"{_pct(stats['median'], 9)} {_num(stats['r'], 7, 2)} "
-        f"{_rate(stats['win_rate'], 6)} {_rate(shares['sl'], 6)} "
-        f"{_rate(shares['be'], 6)} {_rate(shares['tp3'], 6)}"
+        f"{_rate(stats['win_rate'], 6)}{tail}"
     )
 
 
@@ -369,7 +376,10 @@ def print_summary(trades: list[Trade], title: str) -> None:
         f"дистанция стопа {_num(stats['sl_dist'], 5, 2)}% · "
         f"держится {_num(stats['bars'])} бар(ов)\n"
         f"  не закрыто к концу истории: {stats['open']} "
-        f"(в средние и винрейт не входят)"
+        f"(в средние и винрейт не входят)\n"
+        f"  зафиксировано в среднем по всем {stats['total']} сделкам: "
+        f"{_pct(stats['realized_all'])} "
+        f"(открытые учтены по взятым тейкам)"
     )
 
 
