@@ -14,6 +14,7 @@ from app.analysis.signals import Direction
 from app.analysis.trade_rules import (
     REASON_BE,
     REASON_OPEN,
+    REASON_PIVOT,
     REASON_SL,
     REASON_TP3,
     Bar,
@@ -284,3 +285,102 @@ def test_excursions_are_signed():
 
     assert result.mfe_pct == pytest.approx(4.0)
     assert result.mae_pct == pytest.approx(-4.0)
+
+
+# --- стоп на пивоте после tp1 -----------------------------------------------
+
+#: Лесенка дневного прогона: стоп на 2% ниже пивота, тейки 15/50/100,
+#: после tp1 стоп встаёт ровно на пивот, после tp2 — в безубыток.
+PIVOT_RULES = TradeRules.for_timeframe(
+    Timeframe.D1,
+    {
+        "tp1_pct": 15.0,
+        "tp2_pct": 50.0,
+        "tp3_pct": 100.0,
+        "sl_buffer_pct": 2.0,
+        "sl_after_tp1": "pivot",
+        "intrabar_resolution": "off",
+    },
+)
+
+#: Пивот заметно ниже входа: так видно, что выход по нему — убыток.
+DEEP_PIVOT = TradeEntry(time=START, price=ENTRY_PRICE, pivot_price=90.0)
+
+
+def pivot_run(bars, entry=DEEP_PIVOT):
+    return run(bars, rules=PIVOT_RULES, entry=entry)
+
+
+def test_pivot_mode_is_not_the_default():
+    """Молча менять поведение нельзя: режим включается только явно."""
+    assert TradeRules().sl_after_tp1 == "entry"
+    with pytest.raises(ValueError):
+        TradeRules.for_timeframe(Timeframe.D1, {"sl_after_tp1": "somewhere"})
+
+
+def test_stop_moves_to_pivot_after_tp1():
+    """Вход 100, пивот 90: исходный стоп 88.2, после tp1 — ровно 90."""
+    result = pivot_run([bar(1, 116.0, 99.0), bar(2, 101.0, 89.0)])
+
+    assert result.exit_reason == REASON_PIVOT
+    assert [fill.tag for fill in result.fills] == ["tp1", "pivot"]
+    # 30% по +15% и 70% по −10%: выход по пивоту — убыток, а не безубыток
+    assert result.result_pct == pytest.approx(0.3 * 15 + 0.7 * -10)
+
+
+def test_stop_moves_to_entry_only_after_tp2():
+    result = pivot_run(
+        [bar(1, 116.0, 99.0), bar(2, 151.0, 120.0), bar(3, 130.0, 99.0)]
+    )
+
+    assert result.exit_reason == REASON_BE
+    assert [fill.tag for fill in result.fills] == ["tp1", "tp2", "be"]
+    assert result.result_pct == pytest.approx(0.3 * 15 + 0.3 * 50)
+
+
+def test_initial_stop_keeps_its_buffer_and_reason():
+    """До tp1 ничего не изменилось: стоп с буфером, причина прежняя."""
+    result = pivot_run([bar(1, 105.0, 88.0)])
+
+    assert result.exit_reason == REASON_SL
+    assert result.stop_price == pytest.approx(88.2)
+
+
+def test_entry_mode_is_unaffected():
+    """Тот же ряд в прежнем режиме закрывается в безубытке."""
+    plain = TradeRules.for_timeframe(
+        Timeframe.D1,
+        {"tp1_pct": 15.0, "tp2_pct": 50.0, "tp3_pct": 100.0,
+         "sl_buffer_pct": 2.0, "intrabar_resolution": "off"},
+    )
+    result = run(
+        [bar(1, 116.0, 99.0), bar(2, 101.0, 89.0)],
+        rules=plain, entry=DEEP_PIVOT,
+    )
+
+    assert result.exit_reason == REASON_BE
+    assert result.result_pct == pytest.approx(0.3 * 15)
+
+
+def test_pivot_above_entry_falls_back_to_breakeven():
+    """Пивот не ниже входа — стоп уезжает в безубыток, без сюрпризов."""
+    odd = TradeEntry(time=START, price=ENTRY_PRICE, pivot_price=101.0)
+    result = pivot_run([bar(1, 116.0, 99.0), bar(2, 101.0, 95.0)], entry=odd)
+
+    assert result.exit_reason == REASON_BE
+    assert result.result_pct == pytest.approx(0.3 * 15)
+
+
+def test_short_mirrors_the_pivot_step():
+    high_pivot = TradeEntry(time=START, price=ENTRY_PRICE, pivot_price=110.0)
+    result = run(
+        [bar(1, 101.0, 84.0), bar(2, 111.0, 99.0)],
+        rules=PIVOT_RULES, direction=Direction.BEAR, entry=high_pivot,
+    )
+
+    assert result.exit_reason == REASON_PIVOT
+    assert result.result_pct == pytest.approx(0.3 * 15 + 0.7 * -10)
+
+
+def test_describe_mentions_the_pivot_step():
+    assert "после tp1 стоп на пивот" in PIVOT_RULES.describe()
