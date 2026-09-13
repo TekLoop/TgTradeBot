@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,9 +39,15 @@ CREATE TABLE IF NOT EXISTS asset_timeframes (
     FOREIGN KEY (symbol) REFERENCES assets(symbol) ON DELETE CASCADE
 );
 
+-- Оверрайды порогов. Ключ составной: (key, timeframe).
+-- ВАЖНО: маркер глобального оверрайда — пустая строка '', НЕ NULL.
+-- В SQLite NULL в составном PRIMARY KEY не конфликтует сам с собой, поэтому
+-- с NULL пролезли бы дубли одного и того же глобального ключа.
 CREATE TABLE IF NOT EXISTS params (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    key       TEXT NOT NULL,
+    timeframe TEXT NOT NULL DEFAULT '',
+    value     TEXT NOT NULL,
+    PRIMARY KEY (key, timeframe)
 );
 
 CREATE TABLE IF NOT EXISTS sent_alerts (
@@ -54,6 +61,8 @@ CREATE TABLE IF NOT EXISTS sent_alerts (
     PRIMARY KEY (symbol, timeframe, alert_type, candle_time)
 );
 
+-- candle_time/price/rsi хранят ОПОРНУЮ точку chain[0]; chain_json — цепочку
+-- целиком. Старые колонки оставлены, чтобы не ломать прежние обработчики.
 CREATE TABLE IF NOT EXISTS anchors (
     symbol     TEXT NOT NULL,
     timeframe  TEXT NOT NULL,
@@ -61,6 +70,7 @@ CREATE TABLE IF NOT EXISTS anchors (
     candle_time TEXT,
     price      REAL,
     rsi        REAL,
+    chain_json TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (symbol, timeframe, direction)
 );
@@ -115,7 +125,75 @@ class Storage:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
+        await self._migrate()
         log.info("SQLite готова: %s", self.db_path)
+
+    # --- миграции -----------------------------------------------------------
+
+    async def _has_column(self, table: str, column: str) -> bool:
+        cur = await self.conn.execute(f"pragma table_info({table})")
+        return any(row["name"] == column for row in await cur.fetchall())
+
+    async def _migrate(self) -> None:
+        """Обе миграции идемпотентны: наличие колонки проверяется до запуска."""
+        await self._migrate_params()
+        await self._migrate_anchors()
+
+    async def _migrate_params(self) -> None:
+        """params: key TEXT PRIMARY KEY → составной ключ (key, timeframe).
+
+        В SQLite нельзя добавить колонку в PRIMARY KEY через ALTER TABLE,
+        поэтому таблица пересобирается целиком, в одной транзакции.
+        Существующие записи становятся глобальными (timeframe = '').
+
+        Заодно переезжает переименованный параметр: max_bars_between раньше
+        делал две работы сразу — ограничивал возраст цепочки И расстояние
+        в паре. Поэтому его значение раскладывается в ОБА новых параметра,
+        иначе прежнее поведение поехало бы, а max > ttl не прошёл бы валидацию.
+        """
+        if await self._has_column("params", "timeframe"):
+            return
+        log.info("Миграция params: составной ключ (key, timeframe)")
+        await self.conn.executescript(
+            """
+            BEGIN;
+            CREATE TABLE params_new (
+                key       TEXT NOT NULL,
+                timeframe TEXT NOT NULL DEFAULT '',
+                value     TEXT NOT NULL,
+                PRIMARY KEY (key, timeframe)
+            );
+            INSERT INTO params_new(key, timeframe, value)
+                SELECT key, '', value FROM params
+                WHERE key <> 'max_bars_between';
+            INSERT OR IGNORE INTO params_new(key, timeframe, value)
+                SELECT 'max_bars_between_points', '', value FROM params
+                WHERE key = 'max_bars_between';
+            INSERT OR IGNORE INTO params_new(key, timeframe, value)
+                SELECT 'anchor_ttl_bars', '', value FROM params
+                WHERE key = 'max_bars_between';
+            DROP TABLE params;
+            ALTER TABLE params_new RENAME TO params;
+            COMMIT;
+            """
+        )
+        await self.conn.commit()
+
+    async def _migrate_anchors(self) -> None:
+        """anchors: добавление chain_json.
+
+        Ограничение SQLite на ALTER TABLE касается колонок первичного ключа;
+        здесь PK не меняется, и ADD COLUMN отрабатывает одной строкой.
+
+        Старые строки содержат ПОСЛЕДНИЕ точки, помеченные как опорные.
+        Данные отображательные, в расчёт не читаются и перезапишутся
+        при первом же опросе.
+        """
+        if await self._has_column("anchors", "chain_json"):
+            return
+        log.info("Миграция anchors: ADD COLUMN chain_json")
+        await self.conn.execute("ALTER TABLE anchors ADD COLUMN chain_json TEXT")
+        await self.conn.commit()
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -229,28 +307,58 @@ class Storage:
 
     # --- параметры ----------------------------------------------------------
 
-    async def get_param_overrides(self) -> dict:
-        cur = await self.conn.execute("SELECT key, value FROM params")
-        out: dict = {}
+    async def get_param_overrides(self) -> tuple[dict, dict[Timeframe, dict]]:
+        """(глобальные оверрайды, оверрайды по таймфреймам).
+
+        Глобальный оверрайд хранится с timeframe = '' — см. комментарий
+        к схеме: NULL здесь использовать нельзя.
+        """
+        cur = await self.conn.execute("SELECT key, timeframe, value FROM params")
+        global_over: dict = {}
+        by_tf: dict[Timeframe, dict] = {}
         for row in await cur.fetchall():
             try:
-                out[row["key"]] = json.loads(row["value"])
+                value = json.loads(row["value"])
             except json.JSONDecodeError:
                 continue
-        return out
+            raw_tf = row["timeframe"] or ""
+            if not raw_tf:
+                global_over[row["key"]] = value
+                continue
+            tf = Timeframe.try_parse(raw_tf)
+            if tf is None:
+                continue
+            by_tf.setdefault(tf, {})[row["key"]] = value
+        return global_over, by_tf
 
-    async def set_param(self, key: str, value) -> None:
+    async def set_param(self, key: str, value, timeframe: Timeframe | None = None) -> None:
         async with self._lock:
             await self.conn.execute(
-                """INSERT INTO params(key, value) VALUES (?, ?)
-                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-                (key, json.dumps(value)),
+                """INSERT INTO params(key, timeframe, value) VALUES (?, ?, ?)
+                   ON CONFLICT(key, timeframe) DO UPDATE SET value=excluded.value""",
+                (key, timeframe.value if timeframe else "", json.dumps(value)),
             )
             await self.conn.commit()
 
-    async def clear_params(self) -> None:
+    async def reset_param(self, key: str, timeframe: Timeframe | None = None) -> bool:
+        """Снимает один оверрайд. True — запись была и удалена."""
         async with self._lock:
-            await self.conn.execute("DELETE FROM params")
+            cur = await self.conn.execute(
+                "DELETE FROM params WHERE key = ? AND timeframe = ?",
+                (key, timeframe.value if timeframe else ""),
+            )
+            await self.conn.commit()
+            return cur.rowcount > 0
+
+    async def clear_params(self, timeframe: Timeframe | None = None) -> None:
+        """Без аргумента — сброс всех оверрайдов, включая оверлеи таймфреймов."""
+        async with self._lock:
+            if timeframe is None:
+                await self.conn.execute("DELETE FROM params")
+            else:
+                await self.conn.execute(
+                    "DELETE FROM params WHERE timeframe = ?", (timeframe.value,)
+                )
             await self.conn.commit()
 
     # --- дедупликация алертов ----------------------------------------------
@@ -310,24 +418,30 @@ class Storage:
         symbol: str,
         timeframe: Timeframe,
         direction: Direction,
-        point: PivotPoint | None,
+        chain: Sequence[PivotPoint] | None,
     ) -> None:
+        """Пишет ОПОРНУЮ точку chain[0] в старые колонки и цепочку в chain_json."""
+        points = list(chain or ())
+        anchor = points[0] if points else None
         async with self._lock:
             await self.conn.execute(
-                """INSERT INTO anchors(symbol, timeframe, direction, candle_time, price, rsi, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO anchors(symbol, timeframe, direction, candle_time,
+                                       price, rsi, chain_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(symbol, timeframe, direction) DO UPDATE SET
                      candle_time=excluded.candle_time,
                      price=excluded.price,
                      rsi=excluded.rsi,
+                     chain_json=excluded.chain_json,
                      updated_at=excluded.updated_at""",
                 (
                     symbol.upper(),
                     timeframe.value,
                     direction.value,
-                    _iso(point.time) if point else None,
-                    point.price if point else None,
-                    point.rsi if point else None,
+                    _iso(anchor.time) if anchor else None,
+                    anchor.price if anchor else None,
+                    anchor.rsi if anchor else None,
+                    json.dumps([p.as_dict() for p in points]) if points else None,
                     _now_iso(),
                 ),
             )
@@ -336,15 +450,30 @@ class Storage:
     async def get_anchor(
         self, symbol: str, timeframe: Timeframe, direction: Direction = Direction.BULL
     ) -> dict | None:
+        """Опорная точка + цепочка. Ключ 'chain' — список точек; при пустом
+        chain_json (строка из старой БД) остаётся только опорная точка."""
         cur = await self.conn.execute(
-            """SELECT candle_time, price, rsi FROM anchors
+            """SELECT candle_time, price, rsi, chain_json FROM anchors
                WHERE symbol=? AND timeframe=? AND direction=?""",
             (symbol.upper(), timeframe.value, direction.value),
         )
         row = await cur.fetchone()
         if row is None or row["candle_time"] is None:
             return None
-        return dict(row)
+        data = dict(row)
+        raw_chain = data.pop("chain_json", None)
+        chain: list[PivotPoint] = []
+        if raw_chain:
+            try:
+                chain = [PivotPoint.from_dict(item) for item in json.loads(raw_chain)]
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                log.warning(
+                    "%s:%s: битый chain_json, откатываюсь на одну точку",
+                    symbol.upper(), timeframe.value,
+                )
+                chain = []
+        data["chain"] = chain
+        return data
 
     # --- seeding (первый прогон без спама) ---------------------------------
 

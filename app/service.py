@@ -15,12 +15,13 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import pandas as pd
+from pydantic import ValidationError
 
 from app.analysis.signals import AnalysisResult, Direction, DivergenceEngine, Signal
 from app.bot.notifier import Notifier
 from app.bot.outcomes import Outcome, OutcomeStore
 from app.bot.storage import Storage, TrackingUnit
-from app.config import EDITABLE_PARAMS, ParamsConfig
+from app.config import ParamsConfig, build_params, format_validation_error
 from app.core.timeframes import Timeframe
 from app.data.base import DataProvider
 
@@ -46,27 +47,110 @@ class TrackingService:
         providers: dict[str, DataProvider],
         base_params: ParamsConfig,
         notifier: Notifier | None = None,
+        params_by_timeframe: dict[Timeframe, dict] | None = None,
     ) -> None:
         self.storage = storage
         self.providers = providers
         self.base_params = base_params
+        self.params_by_timeframe = dict(params_by_timeframe or {})
         self.notifier = notifier
         self.outcomes = OutcomeStore(storage)
 
     # --- параметры ----------------------------------------------------------
 
-    async def effective_params(self) -> ParamsConfig:
-        """YAML-дефолты, поверх которых наложены правки из /params."""
-        overrides = await self.storage.get_param_overrides()
-        merged = self.base_params.model_dump()
-        for key, value in overrides.items():
-            if key in EDITABLE_PARAMS:
-                merged[key] = value
+    async def effective_params(self, tf: Timeframe | None = None) -> ParamsConfig:
+        """Собранный конфиг таймфрейма: база + YAML-оверлей + оверрайды из БД.
+
+        Откат при битой сборке ТОЧЕЧНЫЙ. Молчаливый откат на base_params целиком
+        с per-TF настройками недопустим: одна битая запись снесла бы всю
+        конфигурацию таймфрейма без следа. Сначала отбрасываются оверрайды
+        этого таймфрейма, затем все оверрайды из БД (остаётся база + YAML),
+        и лишь в самом безнадёжном случае — голая база.
+        """
+        global_over, by_tf = await self.storage.get_param_overrides()
+        yaml_overlay = self.params_by_timeframe.get(tf) if tf is not None else None
+        tf_overlay = by_tf.get(tf) if tf is not None else None
+        label = tf.value if tf is not None else "глобально"
+
+        attempts = (
+            (global_over, tf_overlay),
+            (global_over, None),
+            (None, None),
+        )
+        for attempt, (glob, per_tf) in enumerate(attempts):
+            try:
+                return build_params(self.base_params, yaml_overlay, glob, per_tf)
+            except ValidationError as exc:
+                if attempt == 0:
+                    log.error(
+                        "%s: оверрайды таймфрейма не прошли валидацию (%s) — "
+                        "отбрасываю их, остальные таймфреймы не затронуты",
+                        label, format_validation_error(exc),
+                    )
+                elif attempt == 1:
+                    log.error(
+                        "%s: оверрайды из БД не прошли валидацию (%s) — "
+                        "остаётся база + YAML",
+                        label, format_validation_error(exc),
+                    )
+                else:
+                    log.error(
+                        "%s: не собирается даже база + YAML (%s)",
+                        label, format_validation_error(exc),
+                    )
+        return self.base_params
+
+    async def configured_timeframes(self) -> list[Timeframe]:
+        """Таймфреймы, у которых есть собственные настройки: YAML или БД."""
+        _, by_tf = await self.storage.get_param_overrides()
+        found = set(self.params_by_timeframe) | set(by_tf)
+        return sorted(found, key=lambda tf: tf.minutes)
+
+    async def validate_override(
+        self, key: str, value, tf: Timeframe | None
+    ) -> str | None:
+        """Проверяет кандидат-конфиг ЦЕЛИКОМ перед записью в БД.
+
+        Возвращает текст ошибки или None. Для глобальной правки проверяются
+        все таймфреймы, у которых нет собственного оверрайда этого ключа:
+        правила валидации связывают параметры между собой, и проверка одного
+        значения в отрыве ничего не гарантирует.
+        """
+        global_over, by_tf = await self.storage.get_param_overrides()
+
+        if tf is not None:
+            overlay = dict(by_tf.get(tf) or {})
+            overlay[key] = value
+            try:
+                build_params(
+                    self.base_params, self.params_by_timeframe.get(tf),
+                    global_over, overlay,
+                )
+            except ValidationError as exc:
+                return f"{tf.value}: {format_validation_error(exc)}"
+            return None
+
+        candidate_global = dict(global_over)
+        candidate_global[key] = value
         try:
-            return ParamsConfig.model_validate(merged)
-        except Exception:  # noqa: BLE001 — битые оверрайды не должны валить опрос
-            log.exception("Некорректные оверрайды параметров, использую YAML-дефолты")
-            return self.base_params
+            build_params(self.base_params, None, candidate_global, None)
+        except ValidationError as exc:
+            return format_validation_error(exc)
+
+        for other in sorted(
+            set(self.params_by_timeframe) | set(by_tf), key=lambda t: t.minutes
+        ):
+            overlay = by_tf.get(other) or {}
+            if key in overlay:
+                continue  # у этого ТФ своё значение, глобальное его не заденет
+            try:
+                build_params(
+                    self.base_params, self.params_by_timeframe.get(other),
+                    candidate_global, overlay,
+                )
+            except ValidationError as exc:
+                return f"{other.value}: {format_validation_error(exc)}"
+        return None
 
     # --- основной цикл ------------------------------------------------------
 
@@ -80,7 +164,7 @@ class TrackingService:
             log.error("%s: %s", unit.key, outcome.error)
             return outcome
 
-        params = await self.effective_params()
+        params = await self.effective_params(unit.timeframe)
         try:
             df = await provider.get_klines(
                 unit.symbol, unit.timeframe, params.lookback_bars
@@ -156,12 +240,14 @@ class TrackingService:
         except Exception:  # noqa: BLE001 — статистика не должна валить опрос
             log.exception("%s: не удалось обновить статистику", unit.key)
 
+        # Пишем цепочку целиком: chain[0] уедет в старые колонки как опорная
+        # точка, остальное — в chain_json для /status.
         await self.storage.save_anchor(
-            unit.symbol, unit.timeframe, Direction.BULL, result.bull_anchor
+            unit.symbol, unit.timeframe, Direction.BULL, result.bull_chain
         )
         if params.bearish_enabled:
             await self.storage.save_anchor(
-                unit.symbol, unit.timeframe, Direction.BEAR, result.bear_anchor
+                unit.symbol, unit.timeframe, Direction.BEAR, result.bear_chain
             )
 
         if not seeded:
@@ -188,13 +274,23 @@ class TrackingService:
             if entry_time is None or entry_price is None:
                 continue
 
+            # Времена точек, выброшенных этой заменой. Закрывать их записи
+            # нужно АДРЕСНО: на практике открытая запись обычно одна, но
+            # правило не должно опираться на это совпадение.
+            replaced_times = set(signal.replaced_points)
+
             still_open: list[Outcome] = []
             for record in open_records:
                 if record.entry_time >= entry_time:
                     still_open.append(record)   # запись новее сигнала — не трогаем
                     continue
                 await self._advance(record, df, until=entry_time)
-                reason = "reverse" if record.direction is not signal.direction else "same"
+                if record.signal_time in replaced_times:
+                    reason = "replaced"
+                else:
+                    reason = (
+                        "reverse" if record.direction is not signal.direction else "same"
+                    )
                 await self.outcomes.close(record, entry_time, entry_price, reason)
             open_records = still_open
 
@@ -286,6 +382,15 @@ def _signal_payload(signal: Signal) -> dict:
         payload["pivot"] = signal.pivot.as_dict()
     if len(signal.chain) > 2:
         payload["chain"] = [point.as_dict() for point in signal.chain]
+    # Признак замены живёт только здесь и в Signal: в таблицу outcomes он
+    # не добавляется, ответ на вопрос «была ли замена» даёт exit_reason.
+    if signal.replaced_from is not None:
+        payload["replaced_from"] = signal.replaced_from
+        payload["replaced_points"] = [_iso_or_none(ts) for ts in signal.replaced_points]
+    if signal.wick_pct is not None:
+        payload["wick_pct"] = signal.wick_pct
+    if signal.ohlc is not None:
+        payload["ohlc"] = list(signal.ohlc)
     return payload
 
 
