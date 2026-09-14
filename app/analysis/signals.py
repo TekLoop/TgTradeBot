@@ -20,6 +20,10 @@
   3. превышение anchor_ttl_bars (возраст считается от chain[0]).
 Во всех прочих случаях пивот, не образовавший дивергенцию, молча игнорируется.
 
+ЗАМЕНА ТОЧКИ в цепочке законна только при обновлении минимума: новый пивот
+ниже chain[-1], но RSI ушёл ещё ниже. Цена последней точки цепочки может
+только понижаться — пивот выше chain[-1] игнорируется молча.
+
 max_bars_between_points цепочку НЕ убивает: он ограничивает только расстояние
 внутри пары, образующей дивергенцию, и проверяется при обходе цепочки назад.
 chain_max_points запрещает продление, но цепочку не трогает.
@@ -487,19 +491,29 @@ class DivergenceEngine:
         max_bars_between_points меряется до Pj, а НЕ до chain[-1]: расстояние
         ограничивает пару, образующую дивергенцию. Пара с более ранней точкой
         законна, даже если до последней точки цепочки уже далеко.
+
+        Замена точки законна ТОЛЬКО когда цена обновила минимум цепочки:
+        новый пивот ниже chain[-1], но RSI ушёл ещё ниже, поэтому дивергенция
+        против chain[-1] распалась и пересчитывается от более ранней точки.
+        Пивот ВЫШЕ chain[-1] минимум не обновил, дивергенции не образует ни с
+        чем и не имеет права поднимать нижнюю ступень цепочки: без этой
+        проверки обход проваливался к опорной и подменял глубокий минимум
+        свежим мелким, а стоп уезжал к нему же.
         """
         p = self.params
+        if chain and not rules.price_broke(point.price, chain[-1].price):
+            return None
         for j in range(len(chain) - 1, -1, -1):
-            candidate = chain[j]
-            if not rules.price_broke(point.price, candidate.price):
+            link = chain[j]
+            if not rules.price_broke(point.price, link.price):
                 continue
-            if not rules.rsi_diverged(point.rsi, candidate.rsi):
+            if not rules.rsi_diverged(point.rsi, link.rsi):
                 continue
             if not rules.rsi_in_zone(point.rsi):
                 continue
             if (
                 p.max_bars_between_points > 0
-                and point.index - candidate.index > p.max_bars_between_points
+                and point.index - link.index > p.max_bars_between_points
             ):
                 continue
             # Потолок запрещает продление, но замены (j < n) укорачивают
