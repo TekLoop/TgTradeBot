@@ -10,6 +10,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from app.analysis.indicators import rsi
+from app.analysis.pivots import pivot_low_indices
 from app.analysis.signals import (
     AlertType,
     DivergenceEngine,
@@ -23,6 +25,7 @@ from tests.synthetic import (
     build_df,
     build_bear_df,
     divergence_df,
+    higher_low_df,
     invalidation_df,
     lows_scenario,
     make_prices,
@@ -149,6 +152,40 @@ def test_replacement_of_second_point_keeps_degree_two():
     assert replacement.reference.index == 33          # пересчёт от опорной
     assert replacement.replaced_points == (extension.candle_time,)
     assert indices(result.bull_chain) == [33, 60]     # точка 2 выброшена
+
+
+def test_higher_low_does_not_replace_chain_point():
+    """РЕГРЕСС: пивот ВЫШЕ chain[-1] не заменяет точку цепочки.
+
+    Замена задумана под случай «RSI обновил минимум»: цена ниже последней
+    точки, но RSI ушёл ещё ниже, поэтому дивергенция пересчитывается от
+    опорной. Пивот выше chain[-1] минимум не обновил — он обязан быть
+    проигнорирован. Иначе нижняя ступень цепочки поднимается, а стоп
+    уезжает к свежему мелкому минимуму.
+    """
+    df = higher_low_df()
+    result = analyze(df)
+
+    # Предусловия: ряд действительно воспроизводит спорный случай, иначе
+    # тест прошёл бы вхолостую.
+    lows = df["low"].to_numpy(dtype=float)
+    rsi_vals = rsi(df["close"], PARAMS.rsi_period).to_numpy(dtype=float)
+    anchor, second = 33, 43
+    intruder = pivot_low_indices(lows, PARAMS.fractal_n)[-1]
+
+    assert intruder == 56
+    assert lows[intruder] > lows[second]                    # выше последней точки
+    assert lows[intruder] < lows[anchor]                    # но ниже опорной
+    assert rsi_vals[intruder] <= PARAMS.divergence_rsi_max  # RSI в зоне
+    assert rsi_vals[intruder] > rsi_vals[anchor]            # пара с опорной валидна
+    assert max(rsi_vals[second + 1:]) <= PARAMS.reset_rsi   # цепочка не сброшена
+
+    # Ожидаемое поведение: сигнала нет, цепочка не тронута.
+    divergences = divergences_of(result)
+    assert len(divergences) == 1
+    assert divergences[0].replaced_from is None
+    assert len(alerts1_of(result)) == 1
+    assert indices(result.bull_chain) == [anchor, second]
 
 
 def test_extension_to_three_points():

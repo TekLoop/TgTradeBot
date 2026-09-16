@@ -62,6 +62,10 @@ DIVERGENCE_SEGMENTS = [(0.4, 8), (-0.4, 8), (0.4, 8), (-2.0, 10), (1.0, 4), (-1.
 #: Тот же ряд, продлённый третьим минимумом: ещё ниже по цене, ещё выше по RSI.
 TRIPLE_SEGMENTS = DIVERGENCE_SEGMENTS + [(-0.5, 12), (1.0, 5)]
 
+#: Третий минимум ВЫШЕ второго, но всё ещё ниже опорной. Дивергенции с
+#: chain[-1] нет, замена точки должна быть запрещена.
+HIGHER_LOW_SEGMENTS = DIVERGENCE_SEGMENTS + [(-0.5, 8), (1.0, 3)]
+
 #: Второй минимум ВЫШЕ первого — цена не обновила минимум, дивергенции нет.
 NO_DIVERGENCE_SEGMENTS = [(0.4, 8), (-0.4, 8), (0.4, 8), (-2.0, 10), (1.5, 5), (-1.0, 4), (1.0, 6)]
 
@@ -78,6 +82,10 @@ def divergence_df() -> pd.DataFrame:
 
 def triple_df() -> pd.DataFrame:
     return build_df(make_prices(TRIPLE_SEGMENTS))
+
+
+def higher_low_df() -> pd.DataFrame:
+    return build_df(make_prices(HIGHER_LOW_SEGMENTS))
 
 
 def no_divergence_df() -> pd.DataFrame:
